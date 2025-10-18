@@ -4,8 +4,9 @@ use warnings;
 use if $ENV{DEBUG} => 'Debug::Comments';
 
 my $DEFAULT = 'DEFAULT'; # default pool name
-my $MAIN    = threads->can('self') && threads->self;
 my $SIG     = 'CONT';
+my $THREADS = threads::posix->can('create') ? 'threads::posix' : 'threads';
+my $MAIN    = $THREADS->can('self') && $THREADS->self;
 
 package Thread::Subs;
 
@@ -67,7 +68,7 @@ sub _can_tgkill {
 }
 
 INIT {
-    if ($WORKERS and defined($MAIN) and not threads->tid) {
+    if ($WORKERS and defined($MAIN) and not $THREADS->tid) {
         #@! Auto-starting workers
         &end_definitions;
         set_pool($DEFAULT => $WORKERS);
@@ -220,7 +221,7 @@ sub set_pool {
 
 sub _be_worker {
     my ($pool) = @_;
-    my $tid = threads->tid;
+    my $tid = $THREADS->tid;
     #@! Worker $tid spawned for $pool pool
     while (defined(my $work = $REQ{$pool}->dequeue)) {
         my ($result, $sub, @arg) = @$work;
@@ -271,13 +272,14 @@ sub start_workers {
     _die("BUG: workers already started")
         if $STAGE > 1;
     $STAGE = 2;
-    if ($SIG) {
-        my ($caps) = threads->create(\&_can_tgkill);
+    if ($SIG and $THREADS eq 'threads') {
+        #@! Lame thread signals detected; testing for tgkill() capability
+        my ($caps) = $THREADS->create(\&_can_tgkill);
         if (my ($gettid, $tgkill, $signum) = map { $_ + 0 } $caps->join) {
-            #@! Support for tgkill detected (syscall $tgkill)
+            #@! Support for tgkill() detected (syscall $tgkill)
             $! = 0;
             my $tid = syscall($gettid);
-            _die("gettid failed: $!") if $!;
+            _die("gettid syscall failed: $!") if $!;
             no warnings 'redefine';
             *_send_callback_signal = sub {
                 #@! Sending signal $signum ($SIG) to $$/$tid via tgkill
@@ -290,7 +292,7 @@ sub start_workers {
         #@! Starting $pool worker pool ($count)
         $REQ{$pool} = _queue();
         for (1..$count) {
-            my $tid = threads->create(\&_be_worker, $pool)->tid;
+            my $tid = $THREADS->create(\&_be_worker, $pool)->tid;
             $TASK{"$tid-$pool"} = '';
         }
     }
@@ -322,7 +324,7 @@ sub deploy_shims {
     _die("BUG: attempt to deploy shims at wrong stage (STAGE=$STAGE)")
         unless $STAGE == 2;
     _die("BUG: attempted to deploy shims in a thread")
-        if threads->tid;
+        if $THREADS->tid;
     $STAGE = 3;
     for (grep { $SUB{$_}->shim } keys %SUB) {
         no strict 'refs';
@@ -347,7 +349,7 @@ sub stop_workers {
 sub running_workers {
     my @thr;
     for (keys %TASK) {
-        if (my $t = threads->object(/^(\d+)/)) {
+        if (my $t = $THREADS->object(/^(\d+)/)) {
             if    ($t->is_joinable) { $t->join; delete $TASK{$_} }
             elsif ($t->is_running)  { push @thr, $t }
         }
@@ -376,6 +378,7 @@ END {
         else {
             #@! END: Detaching remaining workers
             $_->detach for &running_workers;
+            return;
         }
     }
     #@! END: All threads joined
@@ -416,14 +419,14 @@ sub _callback {
     if ($id && $CB{$id}) {
         _die("BUG: attempt to invoke callback on unready result")
             unless $self->[0];
-        (delete $CB{$id})->($self);
+        eval { (delete $CB{$id})->($self) };
     }
     return;
 }
 
 sub run_callback_queue {
     _die("BUG: result callbacks must be invoked in the main thread")
-        if threads->tid;
+        if $THREADS->tid;
     $CBF = 1; # Suppress signals
     #@! Invoking callbacks
     my $n = 0;
@@ -436,7 +439,7 @@ sub run_callback_queue {
 
 sub cb {
     _die("BUG: result cb method only available in the main thread")
-        if threads->tid;
+        if $THREADS->tid;
     my ($self, $cb) = @_;
     my $id = is_shared($self)
         or _die("BUG: result object is not shared");
@@ -464,7 +467,7 @@ sub _set {
         cond_broadcast($self);
     }
     if ($cb) {
-        if (threads->tid) {
+        if ($THREADS->tid) {
             # Wrong thread: enqueue and maybe signal
             _push_cbq($self);
             &Thread::Subs::_send_callback_signal
@@ -810,12 +813,10 @@ object to convey the results of subs executed in worker threads.  This
 section deals with the functions; see L</"RESULTS"> for the object.
 
 No functions are imported and the import semantics do not support it.
-Functions should be called with their fully qualified names.  In the
-interests of brevity, the "Thread::Subs" package name is omitted here.
-
-Note also that these functions are highly dependent on the order of
-execution.  The overall process is divided up into stages, and each
-function is valid only in particular stages.
+Functions should be called with their fully qualified names.  Note
+also that these functions are highly dependent on execution order.
+The overall process is divided up into stages, and each function is
+valid only in particular stages, as outlined below.
 
 =over 4
 
@@ -858,9 +859,9 @@ import option, but some flexibility is sacrificed in that approach.
 
 =head2 define
 
-    define(\%definitions);           # single hashref
-    define($sub, \%parameters, ...); # sub-hashref pairs
-    define($sub, %parameters);       # sub and name-value pairs
+    Thread::Subs::define(\%defs);              # single hashref
+    Thread::Subs::define($sub, \%params, ...); # sub-hashref pairs
+    Thread::Subs::define($sub, %params);       # sub, name-value pairs
 
 This is a more flexible alternative to the L<ATTRIBUTES> mechanism,
 allowing the properties of threaded subs to be specified.  It is not
@@ -874,7 +875,9 @@ functions by name because hash keys are necessarily strings.  The
 other approaches permit $sub to be either a string or a reference to
 the sub, but see L</"Quirks of Sub Names"> for caveats about using
 references.  Anonymous subs are not allowed because CODE references
-are not sharable between threads: symbolic names are required.
+are not a thread-sharable data type: a request to execute a sub must
+refer to the sub by name.  Work around this by assigning the sub to a
+glob, thus giving it a name.
 
 The %parameters are the same as the L</"ATTRIBUTES"> parameters with a
 couple of exceptions arising from the difference between attribute
@@ -889,7 +892,7 @@ import option "attributes => 'noshim'" was specified.
 
 =head2 end_definitions
 
-    %pool = end_definitions();
+    %pool = Thread::Subs::end_definitions();
 
 This function is only available in stage zero.  It marks the end of
 sub definitions and calculates base worker pool sizes from those
@@ -905,12 +908,12 @@ these values for pool planning, calling this function is optional
 because C<set_pool()> and C<start_workers()> call it on demand.
 
 Note that the end of definitions will also prohibit any further use of
-the "import" method, in case you were thinking of calling outside the
-context of "use" for any reason.
+the "import" method, in case you were thinking of calling it outside
+the context of "use" for any reason.
 
 =head2 set_pool
 
-    %pool = set_pool($pool, $count, ...);
+    %pool = Thread::Subs::set_pool($pool, $count, ...);
 
 This function is permitted in stages zero and one; if called in stage
 zero it calls C<end_definitions()> on your behalf to commence stage
@@ -941,7 +944,7 @@ loaded, of course.
 
 =head2 shim
 
-    $code = shim($sub);
+    $code = Thread::Subs::shim($sub);
 
 This function is only available in stage two and up.  It returns a
 $code ref which can be used to call $sub in a worker thread.  The $sub
@@ -969,7 +972,7 @@ subsequently: the workers continue to see the original sub.
 This replacement has pros and cons.  See the earlier discussion of
 L</"Shims"> for details and alternatives.  You are under no strict
 obligation to use this function, but it may be tidier than the
-alternative, which involves more use of C<shim()>.
+alternative, which involves more explicit use of C<shim()>.
 
 =head2 stop_workers
 
@@ -993,15 +996,22 @@ convenient for simple scripts, but it can hang on a stuck worker.
 
 =head2 running_workers
 
-    @threads = running_workers();
+    @threads = Thread::Subs::running_workers();
 
 This function, primarily intended for internal use, returns a list of
 worker L<threads> objects which are still running.  It also "joins"
 any workers which have ended.  May be called at any time.
 
+A possible use for this is to detect dead workers.  It's important for
+workers to keep running, so simple exceptions will not take them down,
+but there are edge cases beyond control which can theoretically cause
+a worker thread to die.  If you have a long-running process, you may
+want to do an occasional worker head-count with this function and bail
+out if any have gone missing.
+
 =head2 current_tasks
 
-    %tasks = current_tasks();
+    %tasks = Thread::Subs::current_tasks();
 
 Provides a snapshot of the current state of workers in the form of ID
 and sub-name pairs.  The ID is a combination of the thread ID and the
@@ -1041,17 +1051,26 @@ This has no equivalent in L<AnyEvent>.
     $code = $result->cb($code);
 
 Gets and optionally sets the callback for the $result.  This can only
-be done from the main thread: CODE references are not portable across
-threads.  You can only set one callback: it will be called immediately
-if the $result is already available, or from a signal handler when it
-becomes available.  An explicit undef argument cancels the callback,
-and the callback is also removed on execution.  The callback is passed
-the $result as an argument with the promise that it is now ready, such
-that the C<recv()> and C<data()> methods won't block.
+be done from the main thread because while it's possible in principle
+to have callbacks to any thread, it would be very complex to implement
+and use, so support is limited to the simplest case.
+
+You can only set one callback: it will be called immediately if the
+$result is already available, or from a signal handler when it becomes
+available.  This module reduces the use of signals by not sending them
+while the main thread is actively processing the callback queue, but
+one should still keep the contents of a callback to the same basics
+which are suitable in a signal handler.
+
+An explicit undef argument cancels the callback, and the callback is
+also removed on execution.  The callback is passed the $result as an
+argument with the promise that it is now ready, such that C<recv()>
+and C<data()> won't block.  Exceptions in callback code are absorbed
+and ignored, as are returned values.
 
 Note that all outstanding callbacks are cancelled when the process
 reaches the END state.  Avoid calling C<exit()> before callbacks are
-complete if that's a problem.
+complete if that's undesirable.
 
 =head2 ready
 
@@ -1073,7 +1092,7 @@ case is in callback code like the following.
 =head2 run_callback_queue
 
 This is a function which takes no arguments, but it can be invoked as
-a method if desired.  It is normally called from the signal handler
+a method if desired.  It is normally installed as the signal handler
 specified by the L</"signal"> import parameter, but you'll need to
 make other arrangements if you've disabled that for some reason.  When
 called (from the main thread only), it executes callbacks on all ready
@@ -1146,10 +1165,14 @@ handler for the chosen signal, or callbacks will cease to work.
 
 Note also that Perl's support for thread-specific signals is poor.
 The signals built into the threads module are not real OS signals and
-do not interrupt system calls.  This module prefers the Linux-specific
-C<tgkill()> syscall if it can detect support for it, but falls back to
-native pseudo-signals if not.  The lack of interrupts in that case may
-prevent timely resolution of callbacks in event-loop systems.
+do not interrupt system calls, which may prevent timely resolution of
+callbacks in event-loop systems.  This module uses the Linux-specific
+C<tgkill()> syscall instead of C<< threads->kill >> if it can detect
+support for it, but falls back to native pseudo-signals if not.  For
+platforms other than Linux, try the CPAN module L<threads::posix>
+which adds real per-thread OS signal capabilities via the pthreads
+library.  This module uses L<threads::posix> instead of L<threads> if
+it's already loaded.
 
 If you really can't use the signal at all, you can disable it with a
 false value at import, but callbacks won't work except to the extent
@@ -1300,3 +1323,16 @@ to the main thread.
 Lastly, watch out for potential deadlock situations.  A worker that
 blocks waiting for other workers is a potential source of deadlock,
 and it's on you to ensure the potential can't become reality.
+
+=head1 SEE ALSO
+
+TODO
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2025 by Brett Watson.
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+=cut
