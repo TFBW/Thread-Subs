@@ -9,6 +9,7 @@ my $THREADS = threads::posix->can('create') ? 'threads::posix' : 'threads';
 my $MAIN    = $THREADS->can('self') && $THREADS->self;
 
 package Thread::Subs;
+our $VERSION = '0.100';
 
 use threads::shared;
 use Scalar::Util qw(looks_like_number);
@@ -39,7 +40,7 @@ my $STAGE = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
 
 # See start_workers for possible redefinition.
 sub _send_callback_signal {
-    #@! Sending $SIG pseudo-signal
+    #@! Sending $SIG via threads->kill
     $MAIN->kill($SIG);
     return;
 }
@@ -68,7 +69,7 @@ sub _can_tgkill {
 }
 
 INIT {
-    if ($WORKERS and defined($MAIN) and not $THREADS->tid) {
+    if ($WORKERS and defined($MAIN)) {
         #@! Auto-starting workers
         &end_definitions;
         set_pool($DEFAULT => $WORKERS);
@@ -222,7 +223,7 @@ sub set_pool {
 sub _be_worker {
     my ($pool) = @_;
     my $tid = $THREADS->tid;
-    #@! Worker $tid spawned for $pool pool
+    #@! Worker $tid spawned for '$pool' pool
     while (defined(my $work = $REQ{$pool}->dequeue)) {
         my ($result, $sub, @arg) = @$work;
         my $clim = $CLIM{$sub};
@@ -279,7 +280,7 @@ sub start_workers {
             #@! Support for tgkill() detected (syscall $tgkill)
             $! = 0;
             my $tid = syscall($gettid);
-            _die("gettid syscall failed: $!") if $!;
+            _die("gettid ($gettid) syscall failed: $!") if $!;
             no warnings 'redefine';
             *_send_callback_signal = sub {
                 #@! Sending signal $signum ($SIG) to $$/$tid via tgkill
@@ -289,7 +290,7 @@ sub start_workers {
     }
     for my $pool (keys %POOL) {
         my $count = $POOL{$pool};
-        #@! Starting $pool worker pool ($count)
+        #@! Starting '$pool' worker pool ($count)
         $REQ{$pool} = _queue();
         for (1..$count) {
             my $tid = $THREADS->create(\&_be_worker, $pool)->tid;
@@ -305,7 +306,7 @@ sub start_workers {
 sub shim {
     _die("BUG: shim requested before workers started")
         if $STAGE < 2;
-    my ($sub) = @_;
+    my ($sub, $type) = @_;
     $sub = _name($sub);
     my $attr = $SUB{$sub} or _die("BUG: '$sub' is not a threaded sub");
     my $pool = $attr->pool;
@@ -445,9 +446,13 @@ sub cb {
         or _die("BUG: result object is not shared");
     if (@_ > 1) {
         delete $CB{$id};
-        $cb->($self) if $cb and do {
+        eval { $cb->($self) } if do {
             lock($self);
-            $self->[0] ? 1 : do { $CB{$id} = $cb; $self->[1] = 1; 0 };
+            $self->[0] ? defined($cb) : do {
+                $CB{$id} = $cb if $cb;
+                $self->[1] = defined($cb);
+                0
+            };
         };
     }
     return $CB{$id};
@@ -540,11 +545,16 @@ sub future {
         return;
     };
     $self->cb($cb);
+    $f->on_cancel(sub { $self->cb(undef) })
+        unless $self->ready;
     return $f;
 }
 
 sub DESTROY {
-    if (my $id = is_shared($_[0])) { delete $CB{$id} }
+    if (my $id = is_shared($_[0])) {
+        #@! DESTROY result id=$id
+        delete $CB{$id};
+    }
 }
 
 1;
@@ -1062,6 +1072,11 @@ while the main thread is actively processing the callback queue, but
 one should still keep the contents of a callback to the same basics
 which are suitable in a signal handler.
 
+Once you've set a callback, you are not obliged to keep the $result
+object: it will be kept alive by the worker thread which is providing
+the result, and then by the callback itself.  If no further references
+to it are created, it will be destroyed when the callback completes.
+
 An explicit undef argument cancels the callback, and the callback is
 also removed on execution.  The callback is passed the $result as an
 argument with the promise that it is now ready, such that C<recv()>
@@ -1121,7 +1136,11 @@ the result object.
 
 This requires L<Future> to be loaded and returns an object of that
 type which will be C<done()> or C<fail()> in accordance with the
-result object.
+result object.  You can C<cancel()> the Future to remove the callback.
+The callback maintains a reference to the Future, so the Future object
+will persist until it resolves or you cancel it.
+
+If you have L<Future::AsyncAwait> loaded, you can C<await> this.
 
 =head2 Other Methods
 
@@ -1326,7 +1345,10 @@ and it's on you to ensure the potential can't become reality.
 
 =head1 SEE ALSO
 
-TODO
+L<threads::posix> enhances L<threads> to use real per-thread signals
+via the POSIX pthreads library.  Recommended if you're using a POSIX
+platform other than Linux or if the C<tgkill()> work-around isn't
+working for you on Linux.
 
 =head1 LICENSE AND COPYRIGHT
 
