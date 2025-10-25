@@ -35,6 +35,7 @@ my %SUB;           # all subs Thread::Subs::attr
 my %TASK  :shared; # per-thread current sub
 
 my $ENDWAIT = 0;
+my $INITTED = 0;
 my $WORKERS = 0;
 my $STAGE = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
 
@@ -68,40 +69,55 @@ sub _can_tgkill {
     return @x;
 }
 
+sub startup {
+    _die("Already started")
+        if $STAGE > 1;
+    &set_pool if @_;
+    my %pool = &start_workers;
+    &deploy_shims;
+    return %pool;
+}
+
 INIT {
+    $INITTED = 1;
     if ($WORKERS and defined($MAIN)) {
-        #@! Auto-starting workers
-        &end_definitions;
-        set_pool($DEFAULT => $WORKERS);
+        my %pool = &end_definitions;
+        set_pool($DEFAULT => $WORKERS)
+            if $pool{DEFAULT};
         &start_workers;
         &deploy_shims;
     }
 }
 
 sub import {
-    _die("Import unavailable because end_definitions() has been called")
-        if $STAGE > 0;
     my ($class, %arg) = @_;
     my $caller = caller;
     while (my ($n, $v) = each %arg) {
         if ($n eq 'attributes' and $v) {
+            _die("Too late to import attributes")
+                if $STAGE > 0;
             no strict 'refs';
-            push @{"${caller}::ISA"}, 'Thread::Subs::attributes';
+            push @{"${caller}::ISA"}, 'Thread::Subs::attributes'
+                unless exists $SHIM{$caller};
             $SHIM{$caller} = $v ne 'noshim';
         }
         elsif ($n eq 'autostart') {
             _die("Invalid number of workers '$v'")
                 if $v and $v =~ /\D/;
+            _die("Too late to autostart")
+                if $INITTED;
             $WORKERS = $v;
         }
         elsif ($n eq 'endwait') {
             _die("Invalid endwait '$v'")
                 unless looks_like_number($v) and $v >= 0;
-            $ENDWAIT = $v if $v > $ENDWAIT;
+            $ENDWAIT = $v;
         }
         elsif ($n eq 'signal') {
             _die("Invalid signal '$v'")
                 if $v and not exists $SIG{$v};
+            _die("Too late to change signal")
+                if $STAGE >= 2;
             $SIG = $v || '';
         }
         else { _die("Invalid $class import option '$n'") }
@@ -118,17 +134,19 @@ sub _name {
     return $sub;
 }
 
+sub _attr { %SUB{&_name} }
+
 sub _define_one {
-    _die("BUG: define() called after end_definitions()")
+    _die("Too late to define sub attributes")
         if $STAGE > 0;
     my ($sub, $prop) = @_;
     $sub = _name($sub);
     my $attr = $SUB{$sub} //= Thread::Subs::attr->new;
     for (keys %$prop) {
-        _die("Invalid define option '$_' for $sub")
+        _die("Invalid attribute '$_' in definition of $sub")
             unless m/^(?:pool|clim|qlim|void|shim)$/;
         my $val = $prop->{$_};
-        _die("Option '$_' must be numeric in define for $sub")
+        _die("Attribute '$_' must be numeric in definition of $sub")
             if /^[cq]lim$/ && $val && $val =~ /\D/;
         $attr->$_($val);
     }
@@ -306,7 +324,7 @@ sub start_workers {
 sub shim {
     _die("BUG: shim requested before workers started")
         if $STAGE < 2;
-    my ($sub, $type) = @_;
+    my ($sub) = @_;
     $sub = _name($sub);
     my $attr = $SUB{$sub} or _die("BUG: '$sub' is not a threaded sub");
     my $pool = $attr->pool;
@@ -398,6 +416,13 @@ sub shim { @_ == 1 ? !!$_[0][4]           : do { $_[0][4] = $_[1]; $_[0] } }
 package Thread::Subs::result;
 
 use threads::shared;
+use Scalar::Util qw(refaddr);
+
+# %CB requires careful management.  Callback CODE refs can't be
+# shared, so they have to be stored in this hash in the main thread.
+# It's important that callbacks be executed so as to clear out the
+# hash entry: you can't simply catch object expiry with DESTROY
+# because it may be happening in the wrong thread.
 
 my %CB;
 my @CBQ :shared; # call-back queue (ready)
@@ -406,7 +431,11 @@ my $CBF :shared; # call-back flag (do not signal when true)
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 sub _push_cbq  { lock(@CBQ); push @CBQ, @_ }
 sub _flush_cbq { lock(@CBQ); my @q = @CBQ; @CBQ = (); return @q }
-END { %CB = () } # no callbacks post-exit
+
+END {
+    #@! END: Cancel remaining callbacks (@{[scalar keys %CB]})
+    %CB = ();
+}
 
 sub new {
     my ($class) = @_;
@@ -414,20 +443,23 @@ sub new {
     return bless(\@self, ref($class)||$class);
 }
 
+sub _id { $MAIN ? is_shared($_[0]) // _die("BUG: result object not shared") : refaddr($_[0]) }
+
 sub _callback {
     my ($self) = @_;
-    my $id = is_shared($self);
+    my $id = $self->_id;
     if ($id && $CB{$id}) {
         _die("BUG: attempt to invoke callback on unready result")
             unless $self->[0];
         eval { (delete $CB{$id})->($self) };
+        #@! Callback @{[$@ ? "died: $@" : "executed successfully"]}
     }
     return;
 }
 
 sub run_callback_queue {
     _die("BUG: result callbacks must be invoked in the main thread")
-        if $THREADS->tid;
+        if $MAIN and $THREADS->tid;
     $CBF = 1; # Suppress signals
     #@! Invoking callbacks
     my $n = 0;
@@ -440,10 +472,9 @@ sub run_callback_queue {
 
 sub cb {
     _die("BUG: result cb method only available in the main thread")
-        if $THREADS->tid;
+        if $MAIN and $THREADS->tid;
     my ($self, $cb) = @_;
-    my $id = is_shared($self)
-        or _die("BUG: result object is not shared");
+    my $id = $self->_id;
     if (@_ > 1) {
         delete $CB{$id};
         eval { $cb->($self) } if do {
@@ -472,7 +503,7 @@ sub _set {
         cond_broadcast($self);
     }
     if ($cb) {
-        if ($THREADS->tid) {
+        if ($MAIN and $THREADS->tid) {
             # Wrong thread: enqueue and maybe signal
             _push_cbq($self);
             &Thread::Subs::_send_callback_signal
@@ -550,13 +581,6 @@ sub future {
     return $f;
 }
 
-sub DESTROY {
-    if (my $id = is_shared($_[0])) {
-        #@! DESTROY result id=$id
-        delete $CB{$id};
-    }
-}
-
 1;
 __END__
 
@@ -579,6 +603,15 @@ outstanding requests, and provides an asynchronous results interface.
 The net effect is that you can simply declare a sub as "Thread" and
 then call it asynchronously, so long as the data in and out can be
 shared using L<threads::shared>.
+
+The major difference between this module and other similar ones is
+that this one aims for very low cognitive overhead for the programmer:
+one should barely even be aware that other threads are running most of
+the time.  The ideal is that one simply declares a sub to be threaded;
+in practice you also need to change the sub interface to accommodate
+the fact that it becomes non-blocking, but this is handled using an
+API with a long history of practical use and which will be familiar to
+anyone who has used an event loop.
 
 Note that this documentation is not a tutorial on threading or even on
 Perl threads in particular.  It aims to be as accessable as possible,
@@ -687,7 +720,10 @@ tune the thread stack size while you're at it.
 
 The import method, normally called implicitly at "use", expects a list
 of name-value pairs.  Unrecognised names are fatal; the valid names
-and associated value restrictions are as follows.
+and associated value restrictions are as follows.  Note that most of
+these import parameters are only suitable for a C<use> clause rather
+than an explicit C<import> method call due to the timing with which
+they take effect; exceptions are noted.
 
 =head2 attributes
 
@@ -715,7 +751,9 @@ be available by the time your main code starts.
 
 This approach is convenient for the simpler cases where attributes are
 sufficient to define your workforce.  I suggest you use an environment
-variable with fallback to a constant for the number of workers.
+variable with fallback to a constant for the number of workers.  Note
+that if no subs use the DEFAULT pool then the number is ignored, but
+startup will still be automated if true.
 
 =head2 endwait
 
@@ -728,7 +766,9 @@ complete all remaining work before this time limit.
 
 You may want to set this to a nonzero value if your threads are
 potentially doing something you'd rather not interrupt, but the
-trade-off is that process exit may be delayed.
+trade-off is that process exit may be delayed.  It's possible to
+change this value right up until the process reaches the END state:
+simply call C<< Thread::Subs->import(endwait => $value) >>.
 
 =head2 signal
 
@@ -739,8 +779,9 @@ context of this signal handler.  If you set this to a false value,
 then no signal handler is installed and callbacks won't work unless
 you provide an alternative mechanism (see L</"run_callback_queue">).
 
-The signal handler is installed right after the workers start if true.
-An exception is raised if it's not valid.  See also L</"SIGNALS">.
+The signal handler is installed right after the workers start if true,
+and importing this becomes invalid at that point.  An exception is
+raised if it's not valid or too late.  See also L</"SIGNALS">.
 
 =head1 ATTRIBUTES
 
@@ -887,7 +928,7 @@ the sub, but see L</"Quirks of Sub Names"> for caveats about using
 references.  Anonymous subs are not allowed because CODE references
 are not a thread-sharable data type: a request to execute a sub must
 refer to the sub by name.  Work around this by assigning the sub to a
-glob, thus giving it a name.
+glob.  Names must include the package, e.g. "main::foo".
 
 The %parameters are the same as the L</"ATTRIBUTES"> parameters with a
 couple of exceptions arising from the difference between attribute
@@ -904,12 +945,11 @@ import option "attributes => 'noshim'" was specified.
 
     %pool = Thread::Subs::end_definitions();
 
-This function is only available in stage zero.  It marks the end of
-sub definitions and calculates base worker pool sizes from those
-definitions.  All pools will have at least one worker, but the number
-will be increased to match the largest "clim" value in the pool, if
-any.  On return, stage one has commenced and no further calls to
-C<define()> are permitted.
+If called in stage zero, this function calculates base worker pool
+sizes from definitions currently in effect.  All pools will have at
+least one worker, but the number will be increased to match the
+largest "clim" value in the pool, if any.  On return, stage one has
+commenced and no further calls to C<define()> are permitted.
 
 In a list context, a list of name-value pairs is returned, where the
 names are all the pool names and the values are the base worker count.
@@ -917,9 +957,8 @@ In a scalar context, the number of pools is returned.  Unless you need
 these values for pool planning, calling this function is optional
 because C<set_pool()> and C<start_workers()> call it on demand.
 
-Note that the end of definitions will also prohibit any further use of
-the "import" method, in case you were thinking of calling it outside
-the context of "use" for any reason.
+If called in any stage other than zero, the function has no effect and
+simply returns the current worker pool configuration.
 
 =head2 set_pool
 
@@ -949,8 +988,21 @@ size data as C<set_pool()> and C<end_definitions()>, except that it's
 final this time and reflects what's actually running.
 
 You will need to call this function unless you are using the import
-option L</"autostart">.  This function will fail if L<threads> was not
-loaded, of course.
+option L</"autostart"> or the L</"startup"> function.  This function
+will fail if L<threads> was not loaded, of course.
+
+=head2 startup
+
+    %pool = Thread::Subs::startup($pool, $count, ...);
+
+This is an all-in-one convenience function which offers slightly more
+flexibility than the L</"autostart"> import option.  It is permitted
+in stages zero and one; in stage zero it calls C<end_definitions()> on
+your behalf to commence stage one.  It then calls C<set_pool()> with
+the arguments you pass to it (if any), then C<start_workers()>, and
+C<deploy_shims()>.  It returns %pool data from C<start_workers()>.
+
+If successful, stage three has commenced when this function returns.
 
 =head2 shim
 
@@ -961,7 +1013,8 @@ $code ref which can be used to call $sub in a worker thread.  The $sub
 can be given as a name or as a reference, but it must have "Thread"
 attributes or have been the subject of an earlier C<define()> call.
 See L</"Quirks of Sub Names"> for caveats relating to the use of sub
-references.
+references.  An exception is raised if there is no such sub or it has
+not been defined as a Thread sub.
 
 The specific parameters which affect the shim are "pool", which tells
 it where to send the request; "void", which tells it whether to return
@@ -1081,7 +1134,8 @@ An explicit undef argument cancels the callback, and the callback is
 also removed on execution.  The callback is passed the $result as an
 argument with the promise that it is now ready, such that C<recv()>
 and C<data()> won't block.  Exceptions in callback code are absorbed
-and ignored, as are returned values.
+and ignored, so L</"recv"> is a useful method if you want to bail out
+in the faulre case.  Returned values are also ignored.
 
 Note that all outstanding callbacks are cancelled when the process
 reaches the END state.  Avoid calling C<exit()> before callbacks are
@@ -1100,7 +1154,7 @@ case is in callback code like the following.
     my $cb = sub {
         my ($result) = @_;
         my @data = $result->data;
-        if ($result->failed) { do_fail_thing(@data) }
+        if ($result->failed) { do_failure_thing(@data) }
         else { do_success_thing(@data) }
     };
 
@@ -1137,10 +1191,18 @@ the result object.
 This requires L<Future> to be loaded and returns an object of that
 type which will be C<done()> or C<fail()> in accordance with the
 result object.  You can C<cancel()> the Future to remove the callback.
-The callback maintains a reference to the Future, so the Future object
-will persist until it resolves or you cancel it.
+Be aware that the Future and result have mutual references such that
+both will persist until the callback occurs or you cancel the Future.
 
-If you have L<Future::AsyncAwait> loaded, you can C<await> this.
+If you have L<Future::AsyncAwait> loaded, you can C<await> this in the
+context of an C<async sub>, per the following example.
+
+    sub foo :Thread { ... }
+    async sub bar {
+        ...
+        my @result = await foo(@args)->future;
+        ...
+    }
 
 =head2 Other Methods
 
@@ -1321,6 +1383,49 @@ If an object meets the data requirements but you don't want to shim
 its methods directly, write threaded sub wrappers around the part of
 the API you want to use asynchronously.  These functions, being new,
 won't affect any existing code.
+
+=head2 Original or Shim?
+
+If you are deploying shims to replace the original subs, the original
+interface still applies in certain contexts.  First and foremost, it
+applies from any code which runs in a worker, which means code inside
+any threaded sub (including recursive calls).  It could also apply to
+a CODE ref taken before shims were deployed.
+
+If you aren't deploying shims, of course, then the original interface
+always applies: only CODE references returned by C<shim()> provide the
+async interface; all direct calls are synchronous.  If you want the
+flexibility of calling some subs both synchronously or asynchronously,
+this is the best approach.  You can even assign the shim to a glob to
+make it available by name, as in the following example.
+
+    use Thread::Subs (attributes => 'noshim', autostart => 1);
+    sub foo :Thread { ... }
+    *foo_async = Thread::Subs::shim(\&foo);
+    my $result = foo_async(...);
+    my @sync_result = foo(...);
+
+An environment containing both auto-shimmed and original subs is
+possible but discouraged as it encompasses some confusing edge cases.
+For example, consider the following case.
+
+    use threads;
+    use Thread::Subs;
+    sub foo { ... }
+    sub bar { ... }
+    Thread::Subs::define(
+        \&foo => { shim => 0 },
+        \&bar => { shim => 1 },
+    );
+    Thread::Subs::startup(DEFAULT => 1);
+
+Once this code has executed, C<foo()> still refers to the original
+sub, but C<bar()> refers to a shim.  What should you do if you want to
+call C<bar()> from within C<foo()>?  The normal rule is that you call
+it via the original interface, but if C<foo()> is called directly from
+the main thread, the shimmed interface will still be current.  If it's
+called via a shim, on the other hand, the code executes in a worker
+thread which sees the original interface.  This is a mess.
 
 =head2 Threads Calling Threads
 
