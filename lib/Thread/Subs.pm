@@ -268,6 +268,8 @@ sub _be_worker {
             else {
                 no strict 'refs';
                 eval { $sub->(@arg) };
+                warn "Exception in void sub '$sub': $@"
+                    if $@;
             }
             #@! Worker $tid executed $sub
             if ($clim) {
@@ -334,6 +336,8 @@ sub shim {
         #@! Requesting $sub pool=$pool void=@{[$void?'yes':'no']} qlim=@{[$qlim?$$qlim+1:'no']}
         my $res = $void ? undef : Thread::Subs::result->new;
         $REQ{$pool}->enqueue(shared_clone([$res, $sub, @_]));
+        $res->warn("Exception in sub '$sub'")
+            unless $void or defined(wantarray);
         $qlim->down if $qlim; # can block
         return $void ? () : $res;
     };
@@ -451,8 +455,8 @@ sub _callback {
     if ($id && $CB{$id}) {
         _die("BUG: attempt to invoke callback on unready result")
             unless $self->[0];
-        eval { (delete $CB{$id})->($self) };
-        #@! Callback @{[$@ ? "died: $@" : "executed successfully"]}
+        (delete $CB{$id})->($self);
+        #@! Callback executed successfully
     }
     return;
 }
@@ -477,7 +481,7 @@ sub cb {
     my $id = $self->_id;
     if (@_ > 1) {
         delete $CB{$id};
-        eval { $cb->($self) } if do {
+        $cb->($self) if do {
             lock($self);
             $self->[0] ? defined($cb) : do {
                 $CB{$id} = $cb if $cb;
@@ -490,7 +494,7 @@ sub cb {
 }
 
 sub ready  { $_[0][0] }
-sub failed { $_[0][0] < 0 }
+sub failed { $_[0][0] < 0 and $_[0][0]-- }
 
 sub _set {
     my $self = shift;
@@ -517,18 +521,12 @@ sub _set {
 sub send  { shift()->_set( 1, @_) }
 sub croak { shift()->_set(-1, @_) }
 
-sub _wait {
+sub data {
     my ($self) = @_;
     unless ($self->[0]) {
         lock($self);
         cond_wait(@$self) until $self->[0];
     }
-    return $self;
-}
-
-sub data {
-    my ($self) = @_;
-    $self->_wait unless $self->[0];
     my (undef, @data) = @$self;
     return wantarray ? @data : $data[0];
 }
@@ -538,6 +536,28 @@ sub recv {
     my @data = $self->data;
     _die(@data) if $self->failed;
     return wantarray ? @data : $data[0];
+}
+
+sub warn {
+    my ($self, $msg) = @_;
+    $msg ||= "Exception in threaded sub";
+    my $cb = sub {
+        warn "$msg: @{[$_[0]->data]}"
+            if $_[0]->failed;
+    };
+    $self->cb($cb);
+    return $self;
+}
+
+sub fatal {
+    my ($self, $msg) = @_;
+    $msg ||= "Exception in threaded sub";
+    my $cb = sub {
+        die "$msg: @{[$_[0]->data]}"
+            if $_[0]->failed;
+    };
+    $self->cb($cb);
+    return $self;
 }
 
 sub ae_cv {
@@ -857,6 +877,11 @@ you run the risk of exiting your main process before it's done.  As an
 alternative, you could grant it a grace period with the L</"endwait">
 import option.
 
+An exception occuring in a void sub will be emitted as a warning with
+a prefix to that effect.  Note that if you call a non-void sub in a
+void context, it will automatically be given a callback which does
+much the same thing: see the L</"warn"> method for result objects.
+
 =head1 FUNCTIONS
 
 The module is primarily driven by functions, but also has a "result"
@@ -1133,13 +1158,33 @@ to it are created, it will be destroyed when the callback completes.
 An explicit undef argument cancels the callback, and the callback is
 also removed on execution.  The callback is passed the $result as an
 argument with the promise that it is now ready, such that C<recv()>
-and C<data()> won't block.  Exceptions in callback code are absorbed
-and ignored, so L</"recv"> is a useful method if you want to bail out
-in the faulre case.  Returned values are also ignored.
+and C<data()> won't block.  Returned values are ignored.
 
 Note that all outstanding callbacks are cancelled when the process
 reaches the END state.  Avoid calling C<exit()> before callbacks are
 complete if that's undesirable.
+
+=head2 warn
+
+    $result = $result->warn($msg);
+
+Sets the callback to emit a warning message if an exception occurs.
+The output is "$msg: $@"; default text is provided for $msg if it is
+false.  This is recommended when you have no other plans to use the
+returned value or callback, since exceptions might indicate a bug in
+your code that you won't otherwise see.  Returns self.  This has no
+direct equivalent in L<AnyEvent>.
+
+Note that the L</"shim"> code automatically adds this callback to the
+result if you call a non-void sub in a void context, and that void
+subs have a similar built-in warning.  The $msg provided by L</"shim">
+includes the sub name for context.
+
+=head2 fatal
+
+    $result = $result->fatal($msg);
+
+As per L</"warn">, but raises an exception in case of failure.
 
 =head2 ready
 
