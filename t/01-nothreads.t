@@ -17,19 +17,17 @@ ok($a = Thread::Subs::_attr(\&test1), "Sub has attributes");
 is($a->pool, 'DEFAULT', "Default pool");
 is($a->clim, 0, "Default clim");
 is($a->qlim, 0, "Default qlim");
-ok(!$a->void, "Not void by default");
 ok($a->shim, "Auto-shim by default");
 
 Thread::Subs->import(attributes => 'noshim');
 ok(eval <<'', "Declare sub with multiple attribute values");
-sub test2 :Thread(pool=test, clim=1,qlim=10 void) { 2 }
+sub test2 :Thread(pool=test, clim=1,qlim=10) { 2 }
 1;
 
 ok($a = Thread::Subs::_attr(\&test2), "Sub has attributes");
 is($a->pool, 'test', "Correct pool");
 is($a->clim, 1, "Correct clim");
 is($a->qlim, 10, "Correct qlim");
-ok($a->void, "Is void");
 ok(!$a->shim, "Auto-shim disabled");
 
 ok(eval <<'', "Declare sub with pool=SUB");
@@ -71,6 +69,9 @@ is($a->clim, 6, "List-based multi-define");
 Thread::Subs::define(\&test7 => clim => 1);
 $a = Thread::Subs::_attr(\&test7);
 is($a->clim, 1, "List-based single define");
+
+eval { Thread::Subs::define(sub {}); 1 };
+ok($@, "Anonymous sub rejected");
 
 eval <<'';
 sub bad_attr :Thread(invalid) { '?' }

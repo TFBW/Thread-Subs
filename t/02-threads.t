@@ -4,8 +4,6 @@ use strict;
 use warnings;
 BEGIN { eval("use threads") or $::ERR = $@ }
 use threads::shared;
-my $WARN :shared = '';
-BEGIN { close STDERR; open STDERR, '>', \$WARN or die "$!" }
 use Test::More;
 BEGIN {
     unless (threads->can('create')) {
@@ -25,7 +23,15 @@ sub test  :Thread         { &nap }
 sub dies  :Thread         { nap(5); die "@_\n" }
 sub clim1 :Thread(clim=1) { &nap }
 sub qlim1 :Thread(qlim=1) { &nap }
-sub void  :Thread(void)   { die "@_\n" if @_ }
+
+{
+    package Foo;
+    use threads::shared;
+    use Thread::Subs attributes => 1;
+    sub new { shared_clone(bless []) }
+    sub give :Thread(clim=1 pool=PKG) { my $self = shift; push @$self, @_; return $self }
+    sub take :Thread(clim=1 pool=PKG) { return shift @{$_[0]} }
+}
 
 sub busy_workers {
     my %t = &Thread::Subs::current_tasks;
@@ -36,6 +42,14 @@ sub all_idle_ok {
     for (1..5) { last unless &busy_workers; nap(1) }
     cmp_ok(&busy_workers, '==', 0, "All workers idle");
 }
+
+my $ERR = '';
+$SIG{CONT} = do {
+    my $sig = $SIG{CONT};
+    sub { eval { &$sig }; $ERR .= $@ if $@ }
+};
+my $WARN = '';
+$SIG{__WARN__} = sub { $WARN .= "@_" };
 
 my (@r, $x);
 
@@ -65,12 +79,10 @@ ok($@, "Recv raises exception");
 &all_idle_ok;
 
 $x = '';
-clim1($_)->cb(sub { $x .= '1' })
-    for (3, 2); # sequential
-test($_)->cb(sub { $x .= '0' })
-    for (1, 2, 4); # parallel
+for my $n (3,2)   { clim1($n)->cb(sub { $x .= "s$n" }) } # sequential
+for my $n (1,2,4) { test($n) ->cb(sub { $x .= "p$n" }) } # parallel
 test(6)->recv; # delay
-is($x, '00101', "Expected order of completion");
+is($x, 'p1p2s3p4s2', "Expected order of completion");
 
 &all_idle_ok;
 
@@ -85,16 +97,22 @@ dies("void");
 $x = dies("scalar");
 dies("ignored")->data; # forces wait
 &all_idle_ok;
-like($WARN, qr/void$/, "Void context exception produces warning");
+like($ERR, qr/void$/, "Void context exception produces exception");
 eval { $x->fatal };
 like($@, qr/scalar$/, "Fatal method produces exception");
+$x->warn;
+like($WARN, qr/scalar$/, "Warn method produces warning");
+
+eval { Thread::Subs::shim(\&nap) };
+ok($@, "Exception raised on attempt to shim non-thread sub");
+
+$x = Foo->new;
+$x->give(111,222,333);
+is($x->take->recv, 111, "Threaded object works");
 
 $x = time;
-void("void2");
 test(2);
 ok(eval { Thread::Subs::stop_and_wait(); 1 }, "Stop workers");
 cmp_ok(time - $x, '>=', 0.02, "Waited for worker");
-print "## $WARN";
-like($WARN, qr/void2$/, "Void sub exception produced warning");
 
 done_testing();
