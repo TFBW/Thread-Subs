@@ -9,7 +9,7 @@ my $THREADS = threads::posix->can('create') ? 'threads::posix' : 'threads';
 my $MAIN    = $THREADS->can('self') && $THREADS->self;
 
 package Thread::Subs;
-our $VERSION = '0.100';
+our $VERSION = '0.200';
 
 use threads::shared;
 use Scalar::Util qw(looks_like_number);
@@ -22,22 +22,22 @@ use Time::HiRes qw(time);
 
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 sub _bad { _die("Invalid Thread attribute: @_") }
+sub _nap { select(undef, undef, undef, 0.05) }
 sub _sem { Thread::Semaphore->new(@_) }
-sub _queue { Thread::Queue->new }
 
 my %POOL;          # per-pool worker count
-my %SHIM;          # per-package shim setting
+my %SHIM;          # per-package auto-shim setting
 my %CLIM  :shared; # per-sub concurrency limit Semaphores
-my %DEFER :shared; # per-sub queues for concurrency limits
+my %DEFER :shared; # per-sub array for concurrency limits
 my %QLIM  :shared; # per-sub queue limit Semaphores
-my %REQ   :shared; # per-pool request queues
+my %REQ   :shared; # per-pool request Queues
 my %SUB;           # all subs Thread::Subs::attr
 my %TASK  :shared; # per-thread current sub
 
 my $ENDWAIT = 0;
 my $INITTED = 0;
 my $WORKERS = 0;
-my $STAGE = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
+my $STAGE   = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
 
 # See start_workers for possible redefinition.
 sub _send_callback_signal {
@@ -67,15 +67,6 @@ sub _can_tgkill {
     };
     #@! _can_tgkill: @{[$@ ? $@ : "(@x)"]}
     return @x;
-}
-
-sub startup {
-    _die("Already started")
-        if $STAGE > 1;
-    &set_pool if @_;
-    my %pool = &start_workers;
-    &deploy_shims;
-    return %pool;
 }
 
 INIT {
@@ -130,11 +121,11 @@ sub _name {
     $sub = subname($sub) if ref $sub;
     no strict 'refs';
     _die("Sub '$sub' does not exist")
-        unless exists &{$sub};
+        unless exists &$sub;
     return $sub;
 }
 
-sub _attr { %SUB{&_name} }
+sub _attr { %SUB{&_name} } # used by t/01-nothreads.t
 
 sub _define_one {
     _die("Too late to define sub attributes")
@@ -144,13 +135,13 @@ sub _define_one {
     my $attr = $SUB{$sub} //= Thread::Subs::attr->new;
     for (keys %$prop) {
         _die("Invalid attribute '$_' in definition of $sub")
-            unless m/^(?:pool|clim|qlim|void|shim)$/;
+            unless m/^(?:pool|clim|qlim|shim)$/;
         my $val = $prop->{$_};
         _die("Attribute '$_' must be numeric in definition of $sub")
             if /^[cq]lim$/ && $val && $val =~ /\D/;
         $attr->$_($val);
     }
-    if ($attr->clim) { $CLIM{$sub} = _sem($attr->clim); $DEFER{$sub} = _queue() }
+    if ($attr->clim) { $CLIM{$sub} = _sem($attr->clim); $DEFER{$sub} = shared_clone([]) }
     else             { delete $CLIM{$sub}; delete $DEFER{$sub} }
     if ($attr->qlim) { $QLIM{$sub} = _sem($attr->qlim - 1) }
     else             { delete $QLIM{$sub} }
@@ -174,26 +165,25 @@ sub define {
     return;
 }
 
+my %_ATTR = (
+    clim => sub { m/^=(\d+)$/ ? $1 : _bad("clim$_") },
+    pool => sub { m/^=(\w+)$/ ? $1 : _bad("pool$_") },
+    qlim => sub { m/^=(\d+)$/ ? $1 : _bad("qlim$_") },
+    );
 sub _attribute {
     my ($class, $sub) = @_;
     return 1 unless /^Thread(?:\(|$)/;
     $sub = _name($sub);
     my @attr = /^Thread\((.+)\)$/ ? ($1 =~ m/[^, ]+/g) : ();
     #@! Handling attributes for $sub
-    my %attr = (
-        clim => sub { m/^=(\d+)$/ ? $1 : _bad("clim$_") },
-        pool => sub { m/^=(\w+)$/ ? $1 : _bad("pool$_") },
-        qlim => sub { m/^=(\d+)$/ ? $1 : _bad("qlim$_") },
-        void => sub { m/^$/       ? 1  : _bad("'void' takes no value") },
-        );
     my %opt = (shim => $SHIM{$class} ? 1 : 0);
     for (@attr) {
         my ($name, $val) = /^(\w+)(=.+)?$/;
         _bad("'$_' is unrecognised")
-            unless $name && exists($attr{$name});
+            unless $name && exists($_ATTR{$name});
         _bad("multiple '$name' definitions")
             if exists $opt{$name};
-        $opt{$name} = $attr{$name}->() for $val//'';
+        $opt{$name} = $_ATTR{$name}->() for $val//'';
     }
     if ($opt{pool}) {
         if    ($opt{pool} eq 'SUB') { $opt{pool} = $sub   }
@@ -249,7 +239,7 @@ sub _be_worker {
             lock($clim); # exclusive on $clim and $DEFER{$sub}
             unless ($clim->down_nb) {
                 #@! Request for $sub deferred due to concurrency limit
-                $DEFER{$sub}->enqueue($work);
+                push @{$DEFER{$sub}}, $work;
                 next;
             }
         }
@@ -259,22 +249,14 @@ sub _be_worker {
         while ($work) {
             undef $work;
             $qlim->up if $qlim;
-            if ($result) {
-                no strict 'refs';
-                my @res = eval { $sub->(@arg) };
-                if (my $ex = $@) { $result->croak($ex) }
-                else             { $result->send(@res) }
-            }
-            else {
-                no strict 'refs';
-                eval { $sub->(@arg) };
-                warn "Exception in void sub '$sub': $@"
-                    if $@;
-            }
+            no strict 'refs';
+            my @res = eval { $sub->(@arg) };
+            if (my $ex = $@) { $result->croak($ex) }
+            else             { $result->send(@res) }
             #@! Worker $tid executed $sub
             if ($clim) {
                 lock($clim); # exclusive on $clim and $DEFER{$sub}
-                $work = $DEFER{$sub}->dequeue_nb;
+                $work = shift @{$DEFER{$sub}};
                 if ($work) { ($result, undef, @arg) = @$work }
                 else       { $clim->up }
             }
@@ -311,7 +293,7 @@ sub start_workers {
     for my $pool (keys %POOL) {
         my $count = $POOL{$pool};
         #@! Starting '$pool' worker pool ($count)
-        $REQ{$pool} = _queue();
+        $REQ{$pool} = Thread::Queue->new;
         for (1..$count) {
             my $tid = $THREADS->create(\&_be_worker, $pool)->tid;
             $TASK{"$tid-$pool"} = '';
@@ -330,16 +312,15 @@ sub shim {
     $sub = _name($sub);
     my $attr = $SUB{$sub} or _die("BUG: '$sub' is not a threaded sub");
     my $pool = $attr->pool;
-    my $void = $attr->void;
     my $qlim = $QLIM{$sub};
     return sub {
-        #@! Requesting $sub pool=$pool void=@{[$void?'yes':'no']} qlim=@{[$qlim?$$qlim+1:'no']}
-        my $res = $void ? undef : Thread::Subs::result->new;
+        #@! Requesting $sub pool=$pool qlim=@{[$qlim?$$qlim+1:'inf']}
+        my $res = Thread::Subs::result->new;
         $REQ{$pool}->enqueue(shared_clone([$res, $sub, @_]));
-        $res->warn("Exception in sub '$sub'")
-            unless $void or defined(wantarray);
+        $res->fatal("Exception in sub '$sub'")
+            unless defined(wantarray) or $THREADS->tid;
         $qlim->down if $qlim; # can block
-        return $void ? () : $res;
+        return $res;
     };
 }
 
@@ -356,6 +337,15 @@ sub deploy_shims {
         #@! Deployed shim for $_
     }
     return;
+}
+
+sub startup {
+    _die("Already started")
+        if $STAGE > 1;
+    &set_pool if @_;
+    my %pool = &start_workers;
+    &deploy_shims;
+    return %pool;
 }
 
 sub stop_workers {
@@ -384,7 +374,7 @@ sub running_workers {
 sub stop_and_wait {
     #@! Stopping and waiting for workers
     &stop_workers;
-    select(undef, undef, undef, 0.05) while &running_workers;
+    &_nap while &running_workers;
     #@! All worker threads joined
     &Thread::Subs::result::run_callback_queue;
     return;
@@ -395,9 +385,9 @@ sub current_tasks { &running_workers; return %TASK }
 END {
     #@! END: Shutting down workers
     &stop_workers;
-    my $lim = $ENDWAIT + time();
+    my $lim = time + $ENDWAIT;
     while (&running_workers) {
-        if (time < $lim) { select(undef, undef, undef, 0.05) }
+        if (time < $lim) { &_nap }
         else {
             #@! END: Detaching remaining workers
             $_->detach for &running_workers;
@@ -413,8 +403,7 @@ sub new  { bless [] }
 sub pool { @_ == 1 ? $_[0][0] || $DEFAULT : do { $_[0][0] = $_[1]; $_[0] } }
 sub clim { @_ == 1 ? $_[0][1] || 0        : do { $_[0][1] = $_[1]; $_[0] } }
 sub qlim { @_ == 1 ? $_[0][2] || 0        : do { $_[0][2] = $_[1]; $_[0] } }
-sub void { @_ == 1 ? !!$_[0][3]           : do { $_[0][3] = $_[1]; $_[0] } }
-sub shim { @_ == 1 ? !!$_[0][4]           : do { $_[0][4] = $_[1]; $_[0] } }
+sub shim { @_ == 1 ? !!$_[0][3]           : do { $_[0][3] = $_[1]; $_[0] } }
 
 
 package Thread::Subs::result;
@@ -425,8 +414,8 @@ use Scalar::Util qw(refaddr);
 # %CB requires careful management.  Callback CODE refs can't be
 # shared, so they have to be stored in this hash in the main thread.
 # It's important that callbacks be executed so as to clear out the
-# hash entry: you can't simply catch object expiry with DESTROY
-# because it may be happening in the wrong thread.
+# hash entry: you can't simply catch object expiry with DESTROY for
+# shared objects.
 
 my %CB;
 my @CBQ :shared; # call-back queue (ready)
@@ -438,7 +427,8 @@ sub _flush_cbq { lock(@CBQ); my @q = @CBQ; @CBQ = (); return @q }
 
 END {
     #@! END: Cancel remaining callbacks (@{[scalar keys %CB]})
-    %CB = ();
+    $CBF = 1; # No more signals
+    @CBQ = %CB = ();
 }
 
 sub new {
@@ -494,7 +484,7 @@ sub cb {
 }
 
 sub ready  { $_[0][0] }
-sub failed { $_[0][0] < 0 and $_[0][0]-- }
+sub failed { $_[0][0] < 0 }
 
 sub _set {
     my $self = shift;
@@ -655,13 +645,12 @@ expressed as part of the static sub declaration.
 
 Here is a basic example.
 
-    sub foo :Thread(qlim=10 clim=1 void) { ... }
+    sub foo :Thread(qlim=10 clim=1) { ... }
 
 This declares that sub foo() can be called in a thread: "qlim=10"
-means there can be up to ten such calls waiting to execute, "clim=1"
-means only one instance of the sub can execute concurrently, and
-"void" means it does not return a result.  These parameters and others
-are described in more detail later.
+means there can be up to ten such calls waiting to execute; "clim=1"
+means only one instance of the sub can execute concurrently.  These
+parameters and others are described in more detail later.
 
 =head2 Workers
 
@@ -669,7 +658,8 @@ The threads which execute the subs are "workers", potentially divided
 into named "pools" associated with particular subs.  In the simplest
 case, all workers are part of the "DEFAULT" pool.  Workers are spawned
 early in the process lifecycle and persist until shut down.  You can
-decide how many workers and pools you want.
+decide how many workers and pools you want.  Dynamic pool adjustment
+is not available: static pools are used for simplicity and efficiency.
 
 Each worker pool is associated with a L<Thread::Queue> object into
 which requests are enqueued; workers take from the head of this queue
@@ -811,11 +801,10 @@ method from your package, subs can declare a "Thread" attribute with
 the following syntax.
 
 All parameters are optional; where any parameters are present, they
-must be enclosed in parentheses, as in "Thread(void)".  Parameters are
-separated by spaces and/or commas when more than one is present, as in
-"Thread(clim=1, void)".  If the parameter is associated with a value,
-the name must be followed immediately by an equals sign and then the
-value, as in "Thread(pool=foo)".
+must be enclosed in parentheses, as in "Thread(clim=1)".  Parameters
+are separated by spaces and/or commas when more than one is present,
+as in "Thread(clim=1, pool=SUB)".  The parameter name must be followed
+immediately by an equals sign and the value, no quotes.
 
 Unrecognised parameter names produce a compile-time failure.  Valid
 names and their associated values (if any) are as follows.
@@ -864,23 +853,6 @@ return until a worker takes the task from the queue, meaning that the
 worker has I<started> working on the request.  This semi-synchronous
 behaviour may occasionally be quite useful.  In general, however, such
 a small limit is unnecessarily restrictive.
-
-=head2 void
-
-This parameter takes no value and designates a sub which returns no
-value.  When called as a threaded sub, it will return undef/empty
-immediately rather then return a "result" object.  That's one less
-thing to worry about, but it leaves you with no way to tell when the
-sub finishes.  As such, you may prefer to omit this option even if the
-sub returns nothing just so you can tell when it's finished, or else
-you run the risk of exiting your main process before it's done.  As an
-alternative, you could grant it a grace period with the L</"endwait">
-import option.
-
-An exception occuring in a void sub will be emitted as a warning with
-a prefix to that effect.  Note that if you call a non-void sub in a
-void context, it will automatically be given a callback which does
-much the same thing: see the L</"warn"> method for result objects.
 
 =head1 FUNCTIONS
 
@@ -952,19 +924,19 @@ other approaches permit $sub to be either a string or a reference to
 the sub, but see L</"Quirks of Sub Names"> for caveats about using
 references.  Anonymous subs are not allowed because CODE references
 are not a thread-sharable data type: a request to execute a sub must
-refer to the sub by name.  Work around this by assigning the sub to a
-glob.  Names must include the package, e.g. "main::foo".
+refer to the sub by name.  Work around this by assigning anonymous
+subs to a glob, but bear in mind that this must occur before workers
+are started.  Names must include the package, e.g. "main::foo".
 
 The %parameters are the same as the L</"ATTRIBUTES"> parameters with a
 couple of exceptions arising from the difference between attribute
 strings and name-value pairs.  First, the "pool" name can be any
 string; "SUB" and "PKG" are not special cases: use the literal sub or
-package name if you want to achieve the same effect.  Second, "void"
-takes a boolean value, normally 1 since the default is false.  Third,
-there is a "shim" parameter, also boolean and default false, which
-declares whether the L</"deploy_shims"> function should redefine it.
-This is implicitly true for attribute-defined functions unless the
-import option "attributes => 'noshim'" was specified.
+package name if you want to achieve the same effect.  Second, there is
+a "shim" parameter, boolean and default false, which declares whether
+the L</"deploy_shims"> function should redefine it.  This parameter is
+implicitly true for attribute-defined functions unless the import
+option "attributes => 'noshim'" was specified.
 
 =head2 end_definitions
 
@@ -1042,10 +1014,15 @@ references.  An exception is raised if there is no such sub or it has
 not been defined as a Thread sub.
 
 The specific parameters which affect the shim are "pool", which tells
-it where to send the request; "void", which tells it whether to return
-a "result" object; and "qlim", which tells it to potentially block
-before returning.  The "shim" option has no effect on this function:
-that option only alters the behaviour of C<deploy_shims()>.
+it where to send the request, and "qlim", which tells it to possibly
+block before returning.  The "shim" option has no effect on this
+function: that option only alters the behaviour of C<deploy_shims()>.
+
+Note that when $code is called in a void context it will automatically
+apply the L</"fatal"> method to the otherwise-ignored result object.
+This means that an exception thrown in the threaded sub can ultimately
+cause an exception in the main thread.  If this isn't the behaviour
+you want, handle the result object explicitly in some other way.
 
 =head2 deploy_shims
 
@@ -1069,7 +1046,7 @@ any stage, and when it returns, stage four has commenced.  It shuts
 down the queues so that no further subs can be requested: any requests
 already in the queue will still be processed, and worker threads will
 exit when there is no further work to do.  Attempting to use a shim in
-stage four will raise an immediate exception.
+stage four (to submit more work) will raise an immediate exception.
 
 Calling this function is optional as it is always called during END
 processing, with possible additional delay if the L</"endwait"> import
@@ -1109,13 +1086,11 @@ sub name.  May be called at any time.
 =head1 RESULTS
 
 The "result" sub-object (Thread::Subs::result) is returned by the shim
-code which requests that a worker execute a sub unless that sub has
-been defined as "void".  The interface is very similar to "condition
-variables" in L<AnyEvent> with some minor tweaks and caveats.
-
-It's unlikely that you'll want to create any of these objects, so the
-documentation starts with the methods of most interest given that you
-already have one.
+code which requests that a worker execute a sub.  The interface is
+very similar to "condition variables" in L<AnyEvent> with some minor
+tweaks and caveats.  It's unlikely that you'll want to create any of
+these objects, so the documentation starts with the methods of most
+interest given that you already have one.
 
 =head2 recv
 
@@ -1164,27 +1139,28 @@ Note that all outstanding callbacks are cancelled when the process
 reaches the END state.  Avoid calling C<exit()> before callbacks are
 complete if that's undesirable.
 
-=head2 warn
-
-    $result = $result->warn($msg);
-
-Sets the callback to emit a warning message if an exception occurs.
-The output is "$msg: $@"; default text is provided for $msg if it is
-false.  This is recommended when you have no other plans to use the
-returned value or callback, since exceptions might indicate a bug in
-your code that you won't otherwise see.  Returns self.  This has no
-direct equivalent in L<AnyEvent>.
-
-Note that the L</"shim"> code automatically adds this callback to the
-result if you call a non-void sub in a void context, and that void
-subs have a similar built-in warning.  The $msg provided by L</"shim">
-includes the sub name for context.
-
 =head2 fatal
 
     $result = $result->fatal($msg);
 
-As per L</"warn">, but raises an exception in case of failure.
+Sets the callback to raise an exception if an exception occurred in
+the sub.  The output is "$msg: $@"; default text is provided for $msg
+if it is false.  This makes exceptions fatal as usual, but ensures
+they happen in the main thread rather than killing off workers.  Be
+aware that this exception will likely occur in a signal handler where
+it can't be caught.  Returns self; has no equivalent in L<AnyEvent>.
+
+Note that L</"shim"> adds this callback if you call a sub in a void
+context.  The sub name is included in the $msg for context.
+
+=head2 warn
+
+    $result = $result->warn($msg);
+
+As per L</"fatal">, but emits a warning message instead of raising an
+exception.  This is generally the bare minimum one should do with a
+result object if it returns no data, otherwise exceptions will be
+completely invisible, including those caused by errors in your code.
 
 =head2 ready
 
@@ -1223,7 +1199,8 @@ and will replace any existing callback.
 
 This requires L<AnyEvent> to be loaded and returns a real L<AnyEvent>
 condition variable.  This is preferable if you are using L<AnyEvent>,
-because calling C<recv()> on it will run the event loop.
+because calling C<recv()> on it will run the event loop, whereas the
+base result object would block.
 
 =head3 mojo_promise
 
@@ -1309,7 +1286,7 @@ that you call C<Thread::Subs::result::run_callback_queue()> yourself.
 =head2 Use Cases
 
 Dispatching subs to separate threads carries a fair bit of overhead
-compared to normal in-thread calls, but there some compelling use
+compared to normal in-thread calls, but there are some compelling use
 cases which make the cost worth it.  These scenarios represent good
 opportunities to improve throughput.
 
@@ -1355,7 +1332,7 @@ of threads, but it actually has a lot to offer.  Parallelism can be
 much easier to manage in such a localised manner.  A simple example is
 the idea of a log-writing thread: you likely want to emit log messages
 at various points in your code without delaying the primary task, and
-this is a good case for void threaded subs executed by a specialist.
+this is a good case for a specialist threaded sub.
 
 Specialists in a dedicated pool of one have the additional advantage
 of being able to maintain state.  It's possible for multiple threads
@@ -1416,18 +1393,26 @@ if they are real OS-based files.
 
 =head2 Objects
 
-Direct support for objects can be hit and miss.  You can certainly
-design an object to operate with threaded methods: it just needs to
-constrain itself to the limits of L<threads::shared> data and not
-store object data outside the object.  Then, so long as all the
-methods called on the object are shimmed, the object is threaded.  All
-the internal method-to-method calls still use the original synchronous
-interface, so the object does not need to be explicitly thread-aware.
+Passing objects back and forth between threaded subs may or may not
+work, as it depends on the object implementation.  Also, if the object
+is not already shared when passed, you'll pass a shared clone, which
+may not have the desired effect.  The safest approach is to make an
+explicit shared clone of the object and use that.
 
-If an object meets the data requirements but you don't want to shim
-its methods directly, write threaded sub wrappers around the part of
-the API you want to use asynchronously.  These functions, being new,
-won't affect any existing code.
+It's possible to design an object such that some methods are threaded
+subs, should you wish to do that.  The object must constrain itself to
+the limits of L<threads::shared> data, return a shared reference from
+the new() method, and share any data stored outside the object itself.
+You are then at liberty to make method subs threaded as appropriate,
+but it may become confusing if threaded and non-threaded methods call
+each other because of shimming.  For simplicity, non-threaded methods
+should not call threaded ones; the rule is then that all internal
+calls are synchronous: only clients use the async interface.
+
+Rather than construct a fully thread-aware package, it may be simpler
+to construct some threaded wrappers around an otherwise synchronous
+object, particularly if concurrency limits eliminate the need for
+additional locking.  Consider your options.
 
 =head2 Original or Shim?
 
@@ -1477,7 +1462,7 @@ thread which sees the original interface.  This is a mess.
 It's possible for worker threads to call other threaded subs, subject
 to some limitations.  Most of the time it's simply best to call other
 subs the old fashioned synchronous way, but there are reasonable cases
-where you may prefer an asynchronous call, particularly a void one.
+where you may prefer an asynchronous call.
 
 The first major rule is that worker threads can only call threaded
 subs via a closure returned from C<shim()>.  The C<deploy_shims()>
@@ -1485,13 +1470,17 @@ operation happens after worker threads start, so workers always see
 the original global subs, not the shimmed replacements.
 
 The second major rule is that worker threads can only obtain results
-via the blocking C<recv()> or C<data()> methods, not callbacks.  Void
-subs are perfectly fine, of course, but callbacks are strictly limited
-to the main thread.
+via the blocking C<recv()> or C<data()> methods, not callbacks or any
+of the methods which rely on them: callbacks are strictly limited to
+the main thread.  As such, a shim called in a void context in a worker
+thread does not apply the L</"fatal"> method to the result: exceptions
+will simply be ignored entirely.
 
 Lastly, watch out for potential deadlock situations.  A worker that
 blocks waiting for other workers is a potential source of deadlock,
-and it's on you to ensure the potential can't become reality.
+and it's on you to ensure the potential can't become reality.  This
+potential is amplified greatly if you call a sub with a "qlim" limit,
+so avoid that scenario unless you can prove it safe.
 
 =head1 SEE ALSO
 
