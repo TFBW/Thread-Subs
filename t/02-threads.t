@@ -13,7 +13,7 @@ BEGIN {
 }
 use Thread::Subs (
     attributes => 1,
-    autostart  => 10,
+    autostart  => 10, # some tests depend on this number
     );
 use Time::HiRes qw(time);
 
@@ -86,11 +86,12 @@ is($x, 'p1p2s3p4s2', "Expected order of completion");
 
 &all_idle_ok;
 
-$x = time;
+$x = time + 0.02;
 test(2) for 0..9; # all workers busy next 20ms
-qlim1(2); # should block
-$x = time - $x;
-cmp_ok($x, '>=', 0.02, "Blocked by queue limit");
+qlim1(0); # should pass
+cmp_ok(time, '<', $x, "Not blocked by queue limit");
+qlim1(0); # should block
+cmp_ok(time, '>', $x, "Blocked by queue limit");
 
 is($WARN, '', "No warnings");
 dies("void");

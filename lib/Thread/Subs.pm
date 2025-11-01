@@ -23,13 +23,12 @@ use Time::HiRes qw(time);
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 sub _bad { _die("Invalid Thread attribute: @_") }
 sub _nap { select(undef, undef, undef, 0.05) }
-sub _sem { Thread::Semaphore->new(@_) }
 
 my %POOL;          # per-pool worker count
 my %SHIM;          # per-package auto-shim setting
-my %CLIM  :shared; # per-sub concurrency limit Semaphores
+my %CLIM  :shared; # per-sub concurrency limit Semaphore
 my %DEFER :shared; # per-sub array for concurrency limits
-my %QLIM  :shared; # per-sub queue limit Semaphores
+my %QLIM  :shared; # per-sub queue limit Thread::Subs::lim
 my %REQ   :shared; # per-pool request Queues
 my %SUB;           # all subs Thread::Subs::attr
 my %TASK  :shared; # per-thread current sub
@@ -141,9 +140,15 @@ sub _define_one {
             if /^[cq]lim$/ && $val && $val =~ /\D/;
         $attr->$_($val);
     }
-    if ($attr->clim) { $CLIM{$sub} = _sem($attr->clim); $DEFER{$sub} = shared_clone([]) }
-    else             { delete $CLIM{$sub}; delete $DEFER{$sub} }
-    if ($attr->qlim) { $QLIM{$sub} = _sem($attr->qlim - 1) }
+    if ($attr->clim) {
+        $CLIM{$sub} = Thread::Semaphore->new($attr->clim);
+        $DEFER{$sub} = shared_clone([]);
+    }
+    else {
+        delete $CLIM{$sub};
+        delete $DEFER{$sub};
+    }
+    if ($attr->qlim) { $QLIM{$sub} = Thread::Subs::lim->new($attr->qlim) }
     else             { delete $QLIM{$sub} }
     return;
 }
@@ -248,7 +253,7 @@ sub _be_worker {
         my $qlim = $QLIM{$sub};
         while ($work) {
             undef $work;
-            $qlim->up if $qlim;
+            $qlim->out if $qlim;
             no strict 'refs';
             my @res = eval { $sub->(@arg) };
             if (my $ex = $@) { $result->croak($ex) }
@@ -314,12 +319,12 @@ sub shim {
     my $pool = $attr->pool;
     my $qlim = $QLIM{$sub};
     return sub {
-        #@! Requesting $sub pool=$pool qlim=@{[$qlim?$$qlim+1:'inf']}
+        #@! Requesting $sub pool=$pool @{[$qlim ? 'qlim='.$qlim->slack : '']}
         my $res = Thread::Subs::result->new;
+        $qlim->in if $qlim; # can block
         $REQ{$pool}->enqueue(shared_clone([$res, $sub, @_]));
         $res->fatal("Exception in sub '$sub'")
             unless defined(wantarray) or $THREADS->tid;
-        $qlim->down if $qlim; # can block
         return $res;
     };
 }
@@ -404,6 +409,40 @@ sub pool { @_ == 1 ? $_[0][0] || $DEFAULT : do { $_[0][0] = $_[1]; $_[0] } }
 sub clim { @_ == 1 ? $_[0][1] || 0        : do { $_[0][1] = $_[1]; $_[0] } }
 sub qlim { @_ == 1 ? $_[0][2] || 0        : do { $_[0][2] = $_[1]; $_[0] } }
 sub shim { @_ == 1 ? !!$_[0][3]           : do { $_[0][3] = $_[1]; $_[0] } }
+
+
+package Thread::Subs::lim;
+
+use threads::shared;
+
+# Queue limits can't be handled with a simple semaphore because we
+# need to maintain an order of arrival across threads.  This object
+# limits the queue using a ticket dispenser: calls to in() block when
+# the limit is reached, and unblock on a FIFO basis per call to out().
+
+sub new {
+    my ($class, $lim) = @_;
+    my @self :shared = (0, $lim);
+    return bless(\@self, ref($class)||$class);
+}
+
+sub slack { $_[0][1] - $_[0][0] }
+
+sub in {
+    my ($self) = @_;
+    lock($self);
+    my $ticket = $self->[0]++;
+    cond_wait($self) until $ticket < $self->[1];
+    return;
+}
+
+sub out {
+    my ($self) = @_;
+    lock($self);
+    $self->[1]++;
+    cond_broadcast($self);
+    return;
+}
 
 
 package Thread::Subs::result;
@@ -837,22 +876,16 @@ Queue limit: an upper limit on the number of requests for a particular
 sub which can be outstanding, with no assigned worker.  This value
 must be an integer of at least one.  Where absent, there is no limit,
 which means requests never block, but the request queue can grow
-indefinitely.  It's generally better to manage request limits in some
-other way, particularly if you are also using an event loop of some
-kind, but this limit can be convenient in simple cases.
+indefinitely.  Where present, the call will block until the request
+can be inserted into the queue without exceeding the limit.  Note that
+this blocking is not event-loop-friendly, so you may want to manage
+limits some other way if using one.
 
-Note the following particulars of the blocking mechanism.  First, the
-request is enqueued I<before> the limit is checked; any blocking
-occurs I<afterwards>, delaying the function's return by waiting for a
-worker to remove at least one request from the queue if the limit has
-been reached.  A L<Thread::Semaphore> object is used.
-
-The case of "qlim=1" thus has rather special semantics: it will always
-hit the limit when it adds the request to the queue, so it won't
-return until a worker takes the task from the queue, meaning that the
-worker has I<started> working on the request.  This semi-synchronous
-behaviour may occasionally be quite useful.  In general, however, such
-a small limit is unnecessarily restrictive.
+The main thread is usually the only thread making such requests, but
+it is possible to make requests from worker threads as well.  As such,
+more than one thread might block on a queue limit.  If so, they will
+unblock in FIFO order.  Beware of possible deadlock in this case: see
+L<"Threads Calling Threads"> for more detail.
 
 =head1 FUNCTIONS
 
@@ -1488,6 +1521,19 @@ L<threads::posix> enhances L<threads> to use real per-thread signals
 via the POSIX pthreads library.  Recommended if you're using a POSIX
 platform other than Linux or if the C<tgkill()> work-around isn't
 working for you on Linux.
+
+This module has built-in support for L<AnyEvent>, L<Mojolicious> (via
+L<Mojo::Promise>), and L<Future> async interfaces.  It doesn't depend
+on any of them, however: the associated functionality is available if
+the module is already loaded.
+
+L<Thread::Pool> is a mature alternative to this module which requires
+much more active management of the workers and offers no syntactic
+sugar, but it is more appropriate if you need dynamic worker pools.
+
+This module contains comments suitable for L<Debug::Comments>.  If you
+want debug output which shows dispatching and callback activity, you
+can produce it if you have this module available.
 
 =head1 LICENSE AND COPYRIGHT
 
