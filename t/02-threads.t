@@ -11,10 +11,7 @@ BEGIN {
         BAIL_OUT("All further testing requires threads");
     }
 }
-use Thread::Subs (
-    attributes => 1,
-    autostart  => 10, # some tests depend on this number
-    );
+use Thread::Subs;
 use Time::HiRes qw(time);
 
 sub nap { select(undef, undef, undef, $_[0] * 0.01); return @_ }
@@ -27,7 +24,7 @@ sub qlim1 :Thread(qlim=1) { &nap }
 {
     package Foo;
     use threads::shared;
-    use Thread::Subs attributes => 1;
+    use Thread::Subs;
     sub new { shared_clone(bless []) }
     sub give :Thread(clim=1 pool=PKG) { my $self = shift; push @$self, @_; return $self }
     sub take :Thread(clim=1 pool=PKG) { return shift @{$_[0]} }
@@ -42,6 +39,9 @@ sub all_idle_ok {
     for (1..5) { last unless &busy_workers; nap(1) }
     cmp_ok(&busy_workers, '==', 0, "All workers idle");
 }
+
+# Some tests rely on DEFAULT pool having 10 workers
+is(scalar(Thread::Subs::startup(10)), 2, "Started two pools");
 
 my $ERR = '';
 $SIG{CONT} = do {

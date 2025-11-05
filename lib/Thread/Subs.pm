@@ -34,8 +34,6 @@ my %SUB;           # all subs Thread::Subs::attr
 my %TASK  :shared; # per-thread current sub
 
 my $ENDWAIT = 0;
-my $INITTED = 0;
-my $WORKERS = 0;
 my $STAGE   = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
 
 # See start_workers for possible redefinition.
@@ -68,49 +66,17 @@ sub _can_tgkill {
     return @x;
 }
 
-INIT {
-    $INITTED = 1;
-    if ($WORKERS and defined($MAIN)) {
-        my %pool = &end_definitions;
-        set_pool($DEFAULT => $WORKERS)
-            if $pool{DEFAULT};
-        &start_workers;
-        &deploy_shims;
-    }
-}
-
 sub import {
-    my ($class, %arg) = @_;
+    my $class = shift;
     my $caller = caller;
-    while (my ($n, $v) = each %arg) {
-        if ($n eq 'attributes' and $v) {
-            _die("Too late to import attributes")
-                if $STAGE > 0;
-            no strict 'refs';
-            push @{"${caller}::ISA"}, 'Thread::Subs::attributes'
-                unless exists $SHIM{$caller};
-            $SHIM{$caller} = $v ne 'noshim';
-        }
-        elsif ($n eq 'autostart') {
-            _die("Invalid number of workers '$v'")
-                if $v and $v =~ /\D/;
-            _die("Too late to autostart")
-                if $INITTED;
-            $WORKERS = $v;
-        }
-        elsif ($n eq 'endwait') {
-            _die("Invalid endwait '$v'")
-                unless looks_like_number($v) and $v >= 0;
-            $ENDWAIT = $v;
-        }
-        elsif ($n eq 'signal') {
-            _die("Invalid signal '$v'")
-                if $v and not exists $SIG{$v};
-            _die("Too late to change signal")
-                if $STAGE >= 2;
-            $SIG = $v || '';
-        }
-        else { _die("Invalid $class import option '$n'") }
+    unless ($STAGE > 0 or exists $SHIM{$caller}) {
+        no strict 'refs';
+        push @{"${caller}::ISA"}, 'Thread::Subs::attributes';
+    }
+    $SHIM{$caller} = 1;
+    for (@_) {
+        if ($_ eq 'noshim') { $SHIM{$caller} = 0 }
+        else { _die("Invalid $class import option: $_") }
     }
     return;
 }
@@ -221,6 +187,8 @@ sub set_pool {
     &end_definitions if $STAGE == 0;
     _die("BUG: set_pool() called when workers already started")
         if $STAGE > 1;
+    unshift @_, $DEFAULT
+        if @_ == 1;
     while (@_) {
         my $pool = shift;
         _die("No subs use worker pool '$pool'")
@@ -231,6 +199,18 @@ sub set_pool {
         $POOL{$pool} = $count;
     }
     return wantarray ? %POOL : scalar(keys %POOL);
+}
+
+sub signal {
+    if (@_) {
+        my ($sig) = @_;
+        _die("Invalid signal '$sig'")
+            if $sig and not exists $SIG{$sig};
+        _die("Too late to change signal")
+            if $STAGE > 1;
+        $SIG = $sig || '';
+    }
+    return $SIG;
 }
 
 sub _be_worker {
@@ -351,6 +331,16 @@ sub startup {
     my %pool = &start_workers;
     &deploy_shims;
     return %pool;
+}
+
+sub endwait {
+    if (@_) {
+        my ($t) = @_;
+        _die("Invalid endwait '$t'")
+            unless looks_like_number($t) and $t >= 0;
+        $ENDWAIT = $t;
+    }
+    return $ENDWAIT;
 }
 
 sub stop_workers {
@@ -639,7 +629,14 @@ Thread::Subs - Execute selected subs concurrently in worker threads
 
 =head1 SYNOPSIS
 
-TODO (when remaining docs are finalised)
+    # Simple usage
+    use threads;
+    use Thread::Subs;
+    sub foo :Thread { something_complex }
+    Thread::Subs::startup();
+    my $result = foo();
+    # ... do other things while something_complex happens ...
+    my @data = $result->recv;
 
 =head1 DESCRIPTION
 
@@ -659,8 +656,7 @@ one should barely even be aware that other threads are running most of
 the time.  The ideal is that one simply declares a sub to be threaded;
 in practice you also need to change the sub interface to accommodate
 the fact that it becomes non-blocking, but this is handled using an
-API with a long history of practical use and which will be familiar to
-anyone who has used an event loop.
+API which will be familiar to anyone who has used an event loop.
 
 Note that this documentation is not a tutorial on threading or even on
 Perl threads in particular.  It aims to be as accessable as possible,
@@ -672,7 +668,7 @@ the aim of this module is to make threads far more practical.
 There are quite a few moving parts behind the scenes which make this
 all work.  Here's the big-picture view of what's going on.
 
-=head2 Attributes
+=head2 Sub Attributes
 
 Perl has an L<attributes> mechanism which allows the language to be
 extended in various ways.  This module uses that mechanism to add a
@@ -767,77 +763,24 @@ its functionality.  Using this module does not oblige you to use
 threads, but it is effectively a no-op unless you do.  You may want to
 tune the thread stack size while you're at it.
 
-The import method, normally called implicitly at "use", expects a list
-of name-value pairs.  Unrecognised names are fatal; the valid names
-and associated value restrictions are as follows.  Note that most of
-these import parameters are only suitable for a C<use> clause rather
-than an explicit C<import> method call due to the timing with which
-they take effect; exceptions are noted.
+Importing this module enables the "Thread" attribute for subs in the
+importing package.  The details of attribute syntax are given in the
+L<ATTRIBUTES> section.  This feature works by adding a sub-package to
+the caller's @ISA array which containins the C<MODIFY_CODE_ATTRIBUTES>
+method which implements sub attribute processing.  If your package
+implements that method itself or imports it from elsewhere, you'll
+need to make special arrangements.
 
-=head2 attributes
-
-A true value causes the "Thread" sub attribute to be recognised in the
-importing package.  Note that all "Thread" subs in the package are
-auto-shimmed unless the value is "noshim", specifically.  Details of
-the attribute syntax are given in the L<ATTRIBUTES> section.
-
-This feature is enabled on a per-package basis by adding a sub-package
-to the caller's @ISA array containing the C<MODIFY_CODE_ATTRIBUTES>
-method which implements sub attribute processing.  This only works if
-that method is not defined locally or inherited elsewhere, which is
-nearly always the case, but you'll need to make special arrangements
-if using more than one provider of sub attributes.
-
-=head2 autostart
-
-Takes an integer value greater than zero, or false (the default).  If
-true, this automates the worker start-up process.  The value is the
-number of threads to start for the DEFAULT pool.  Other pools get one
-worker or the largest "clim" value associated with a sub in that pool,
-if any are specified.  After all workers are started, deploy_shims()
-is called.  This all happens in an INIT block, so threaded subs will
-be available by the time your main code starts.
-
-This approach is convenient for the simpler cases where attributes are
-sufficient to define your workforce.  I suggest you use an environment
-variable with fallback to a constant for the number of workers.  Note
-that if no subs use the DEFAULT pool then the number is ignored, but
-startup will still be automated if true.
-
-=head2 endwait
-
-Takes a numeric value of zero or more; default zero.  When the process
-exits, some worker threads may still be running, either because the
-work takes a while or because there are still requests in the queue.
-This value gives the number of seconds to wait in the END state before
-giving up and detaching them.  The workers will stop naturally if they
-complete all remaining work before this time limit.
-
-You may want to set this to a nonzero value if your threads are
-potentially doing something you'd rather not interrupt, but the
-trade-off is that process exit may be delayed.  It's possible to
-change this value right up until the process reaches the END state:
-simply call C<< Thread::Subs->import(endwait => $value) >>.
-
-=head2 signal
-
-Takes a signal name (%SIG key) or a false value; default 'CONT'.  The
-callback mechanism relies on worker threads sending a signal to the
-main thread.  The callback is then executed in the main thread in the
-context of this signal handler.  If you set this to a false value,
-then no signal handler is installed and callbacks won't work unless
-you provide an alternative mechanism (see L</"run_callback_queue">).
-
-The signal handler is installed right after the workers start if true,
-and importing this becomes invalid at that point.  An exception is
-raised if it's not valid or too late.  See also L</"SIGNALS">.
+All subs declared with the "Thread" attribute are replaced by a shim
+when L</"deploy_shims"> is called unless you specify "noshim" as an
+argument to the import.  There are no other valid arguments to import
+at this time, and unrecognised arguments will raise an exception.
 
 =head1 ATTRIBUTES
 
-Where the module is imported with a true "attributes" parameter or
-some other technique is used to invoke the C<MODIFY_CODE_ATTRIBUTES>
-method from your package, subs can declare a "Thread" attribute with
-the following syntax.
+Where the module is imported or some other technique is used to invoke
+the C<MODIFY_CODE_ATTRIBUTES> method from your package at compile
+time, subs can declare a "Thread" attribute with the following syntax.
 
 All parameters are optional; where any parameters are present, they
 must be enclosed in parentheses, as in "Thread(clim=1)".  Parameters
@@ -857,7 +800,7 @@ for the value to be meaningful as a limit.  The associated value must
 be an integer of one or more.  Where absent, no limit is applied other
 than the natural limit of the number of running workers.  A common
 case is "clim=1", which allows the sub to be concurrent with the main
-thread and other subs, but not with itself.
+thread and other subs, but not itself: see L</"The Power of One">.
 
 =head2 pool
 
@@ -885,7 +828,7 @@ The main thread is usually the only thread making such requests, but
 it is possible to make requests from worker threads as well.  As such,
 more than one thread might block on a queue limit.  If so, they will
 unblock in FIFO order.  Beware of possible deadlock in this case: see
-L<"Threads Calling Threads"> for more detail.
+L</"Threads Calling Threads"> for more detail.
 
 =head1 FUNCTIONS
 
@@ -934,9 +877,8 @@ closing off the request queues and terminating idle workers.
 
 The functions are presented below in the natural calling order, along
 with their associated restrictions.  Violation of the calling order
-requirements will result in an exception.  Most of these functions are
-unnecessary if you use sub attributes and specify the L</"autostart">
-import option, but some flexibility is sacrificed in that approach.
+requirements will result in an exception.  Simple use cases will only
+require sub attributes and the L</"startup"> function.
 
 =head2 define
 
@@ -969,7 +911,7 @@ package name if you want to achieve the same effect.  Second, there is
 a "shim" parameter, boolean and default false, which declares whether
 the L</"deploy_shims"> function should redefine it.  This parameter is
 implicitly true for attribute-defined functions unless the import
-option "attributes => 'noshim'" was specified.
+option "noshim" was specified.
 
 =head2 end_definitions
 
@@ -992,6 +934,7 @@ simply returns the current worker pool configuration.
 
 =head2 set_pool
 
+    %pool = Thread::Subs::set_pool($count);
     %pool = Thread::Subs::set_pool($pool, $count, ...);
 
 This function is permitted in stages zero and one; if called in stage
@@ -1004,7 +947,26 @@ worker, so all you can do is adjust the numbers.  An exception is
 raised if any $pool argument does not match an existing name, or if
 any $count is not an integer greater than zero.
 
-The return value is as per C<end_definitions()>, post-adjustment.
+The single-argument version sets the 'DEFAULT' pool count.  The return
+value is as per C<end_definitions()>, post-adjustment.
+
+=head2 signal
+
+    $sig = Thread::Subs::signal();
+    $sig = Thread::Subs::signal($sig);
+
+Gets and optionally sets the signal name (%SIG key) used by callbacks,
+default 'CONT'.  The get operation, with no arguments, can be called
+at any time.  The set operation, with one argument, is permitted in
+stages zero and one, before workers are started.
+
+The callback mechanism relies on worker threads sending this signal to
+the main thread when ready.  The callback is then executed in the main
+thread in the context of this signal handler.  If you set $sig to a
+false value, then no signal handler is installed and callbacks won't
+work unless you poll L</"run_callback_queue">; the returned value will
+be empty string in this case.  The signal handler is installed right
+after the workers start if true.  See L</"SIGNALS"> for more detail.
 
 =head2 start_workers
 
@@ -1017,20 +979,17 @@ commenced.  The function takes no arguments and returns the same pool
 size data as C<set_pool()> and C<end_definitions()>, except that it's
 final this time and reflects what's actually running.
 
-You will need to call this function unless you are using the import
-option L</"autostart"> or the L</"startup"> function.  This function
-will fail if L<threads> was not loaded, of course.
-
 =head2 startup
 
+    %pool = Thread::Subs::startup($count);
     %pool = Thread::Subs::startup($pool, $count, ...);
 
-This is an all-in-one convenience function which offers slightly more
-flexibility than the L</"autostart"> import option.  It is permitted
-in stages zero and one; in stage zero it calls C<end_definitions()> on
-your behalf to commence stage one.  It then calls C<set_pool()> with
-the arguments you pass to it (if any), then C<start_workers()>, and
-C<deploy_shims()>.  It returns %pool data from C<start_workers()>.
+This is an all-in-one convenience function to get things started with
+minimal fuss.  It is permitted in stages zero and one; in stage zero
+it calls C<end_definitions()> on your behalf to commence stage one.
+It then calls C<set_pool()> with the arguments you pass to it (if
+any), then C<start_workers()>, and C<deploy_shims()>.  It returns
+%pool data from C<start_workers()>.
 
 If successful, stage three has commenced when this function returns.
 
@@ -1072,6 +1031,26 @@ L</"Shims"> for details and alternatives.  You are under no strict
 obligation to use this function, but it may be tidier than the
 alternative, which involves more explicit use of C<shim()>.
 
+=head2 endwait
+
+    $sec = Thread::Subs::endwait();
+    $sec = Thread::Subs::endwait($sec);
+
+Gets and optionally sets the "endwait" period (in seconds), default
+zero.  Can be called in either form at any time, but $sec must be a
+numeric value of zero or more in set mode or an exception is raised.
+
+When the process exits, some worker threads may still be running,
+either because the work takes a while or because there are still
+requests in the queue.  This value gives the number of seconds to wait
+in the END state before giving up and detaching them.  The workers
+will stop naturally if they complete all remaining work before this
+time limit.  You may want to set this to a nonzero value if your
+threads are potentially doing something you'd rather not interrupt,
+but the trade-off is that process exit may be delayed.  Bear in mind
+that this delay applies both to explicit C<exit()> and abnormal exits
+via C<die()>, but not uncaught signals.
+
 =head2 stop_workers
 
 This function takes no arguments and returns nothing.  It is valid at
@@ -1082,8 +1061,8 @@ exit when there is no further work to do.  Attempting to use a shim in
 stage four (to submit more work) will raise an immediate exception.
 
 Calling this function is optional as it is always called during END
-processing, with possible additional delay if the L</"endwait"> import
-option was defined.  The function effectively becomes a no-op once
+processing, with possible additional delay if L</"endwait"> was given
+a positive value.  The function effectively becomes a no-op once
 called, and it is not possible to restart the workers once stopped.
 
 =head2 stop_and_wait
@@ -1216,10 +1195,12 @@ case is in callback code like the following.
 
 This is a function which takes no arguments, but it can be invoked as
 a method if desired.  It is normally installed as the signal handler
-specified by the L</"signal"> import parameter, but you'll need to
-make other arrangements if you've disabled that for some reason.  When
-called (from the main thread only), it executes callbacks on all ready
-results associated with a callback, and clears the queue.
+specified by the L</"signal"> function, but you'll need to make other
+arrangements if you've disabled it for some reason.  When called (from
+the main thread only), it executes callbacks on any ready results with
+an associated callback and clears the queue.  Any result objects with
+callbacks which become ready during this call will also be processed
+without the need for additional signals.
 
 =head2 Async Adaptors
 
@@ -1280,10 +1261,10 @@ exception reason.  Returns self.
 
 =head1 SIGNALS
 
-As mentioned in the documentation for the L</"signal"> import argument
-and the L</"run_callback_queue"> function, result callbacks require
-the use of a signal to execute callbacks in the main thread.  This is
-the 'CONT' signal unless specified otherwise.
+As mentioned in the documentation for L</"signal"> function and the
+L</"run_callback_queue"> function, result callbacks require the use of
+a signal to execute callbacks in the main thread.  This is the 'CONT'
+signal unless specified otherwise.
 
 'CONT' is a slightly cheeky choice of signal as the default: given the
 standard meaning of 'CONT' (resume if stopped), it would normally be
@@ -1310,9 +1291,10 @@ which adds real per-thread OS signal capabilities via the pthreads
 library.  This module uses L<threads::posix> instead of L<threads> if
 it's already loaded.
 
-If you really can't use the signal at all, you can disable it with a
-false value at import, but callbacks won't work except to the extent
-that you call C<Thread::Subs::result::run_callback_queue()> yourself.
+If you really can't use the signal at all, you can disable it with
+C<Thread::Subs::signal('')> prior to starting workers, but callbacks
+require that you call C<Thread::Subs::result::run_callback_queue()>
+via some other mechanism (like a timer) in this case.
 
 =head1 NOTES
 
@@ -1363,16 +1345,26 @@ Lastly, do not overlook the utility of dedicated specialist workers.
 At first glance, "clim=1" may seem like it defeats the whole purpose
 of threads, but it actually has a lot to offer.  Parallelism can be
 much easier to manage in such a localised manner.  A simple example is
-the idea of a log-writing thread: you likely want to emit log messages
-at various points in your code without delaying the primary task, and
-this is a good case for a specialist threaded sub.
+a log-writing thread: you likely want to emit log messages at various
+points in your code without delaying the primary task, and this is a
+good case for a specialist threaded sub because the concurrency limit
+means you never have overlapping writes.
 
-Specialists in a dedicated pool of one have the additional advantage
-of being able to maintain state.  It's possible for multiple threads
-to share state, but it requires careful avoidance of race conditions
-and other such issues.  It's immensely simpler with only a single
-thread and no possibility of conflict: you get the benefits of some
-parallelism at almost no complexity cost.
+Specialists in a dedicated pool of one ("clim=1, pool=SUB") are able
+to maintain state with almost no limitations.  The same worker always
+executes the sub, so it has the entire interpreter context to itself,
+acting more like a dedicated sub-program.  Subs with "clim=1" in a
+larger pool don't get this level of convenience: they can store state
+in shared variables without additional locking if the variables are
+private to the sub, but they are still subject to the usual limits of
+shared variables (e.g. no filehandles).
+
+In short, the "clim=1" pattern gives you some parallelism at almost no
+complexity cost.  It is the equivalent of wrapping the entire sub in a
+critical section without the drawback of potentially blocking other
+threads which want to perform the same operation, because requests are
+queued unless they hit the queue limit.  It is a compromise which
+offers the best of both worlds and has many practical uses.
 
 =head3 Bad Ideas
 
@@ -1462,10 +1454,11 @@ flexibility of calling some subs both synchronously or asynchronously,
 this is the best approach.  You can even assign the shim to a glob to
 make it available by name, as in the following example.
 
-    use Thread::Subs (attributes => 'noshim', autostart => 1);
+    use Thread::Subs 'noshim';
     sub foo :Thread { ... }
+    Thread::Subs::startup();
     *foo_async = Thread::Subs::shim(\&foo);
-    my $result = foo_async(...);
+    my $async_result = foo_async(...);
     my @sync_result = foo(...);
 
 An environment containing both auto-shimmed and original subs is
@@ -1480,7 +1473,7 @@ For example, consider the following case.
         \&foo => { shim => 0 },
         \&bar => { shim => 1 },
     );
-    Thread::Subs::startup(DEFAULT => 1);
+    Thread::Subs::startup();
 
 Once this code has executed, C<foo()> still refers to the original
 sub, but C<bar()> refers to a shim.  What should you do if you want to
@@ -1490,12 +1483,17 @@ the main thread, the shimmed interface will still be current.  If it's
 called via a shim, on the other hand, the code executes in a worker
 thread which sees the original interface.  This is a mess.
 
+Of course, if you never call C<bar()> from within C<foo()>, then none
+of this matters.  Well, not immediately, at least, but it potentially
+leaves an open pit into which someone may eventually fall.
+
 =head2 Threads Calling Threads
 
 It's possible for worker threads to call other threaded subs, subject
 to some limitations.  Most of the time it's simply best to call other
 subs the old fashioned synchronous way, but there are reasonable cases
-where you may prefer an asynchronous call.
+where you may prefer an asynchronous call, particularly if the sub has
+a "clim=1" constraint you may otherwise violate.
 
 The first major rule is that worker threads can only call threaded
 subs via a closure returned from C<shim()>.  The C<deploy_shims()>
@@ -1507,7 +1505,7 @@ via the blocking C<recv()> or C<data()> methods, not callbacks or any
 of the methods which rely on them: callbacks are strictly limited to
 the main thread.  As such, a shim called in a void context in a worker
 thread does not apply the L</"fatal"> method to the result: exceptions
-will simply be ignored entirely.
+will simply be ignored silently.
 
 Lastly, watch out for potential deadlock situations.  A worker that
 blocks waiting for other workers is a potential source of deadlock,
@@ -1518,9 +1516,10 @@ so avoid that scenario unless you can prove it safe.
 =head1 SEE ALSO
 
 L<threads::posix> enhances L<threads> to use real per-thread signals
-via the POSIX pthreads library.  Recommended if you're using a POSIX
-platform other than Linux or if the C<tgkill()> work-around isn't
-working for you on Linux.
+via the POSIX pthreads library, and this module will use it if already
+loaded.  Recommended if you're using a POSIX platform other than Linux
+or if the C<tgkill()> work-around isn't working for you on Linux due
+to missing "syscall.ph" or some other issue.
 
 This module has built-in support for L<AnyEvent>, L<Mojolicious> (via
 L<Mojo::Promise>), and L<Future> async interfaces.  It doesn't depend

@@ -5,10 +5,7 @@ use warnings;
 use threads;
 use threads::shared;
 use Test::More;
-use Thread::Subs (
-    attributes => 1,
-    autostart  => 5,
-    );
+use Thread::Subs;
 use Time::HiRes qw(time);
 
 BEGIN {
@@ -22,6 +19,7 @@ sub test :Thread { &nap }
 sub dies :Thread { nap(5); die "@_\n" }
 
 my $x;
+is(scalar(Thread::Subs::startup(5)), 1, "One worker pool started");
 
 AE::postpone { $x = 'post' };
 is($x, undef, "Postponed op has not executed");

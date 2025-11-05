@@ -3,9 +3,7 @@ use 5.010;
 use strict;
 use warnings;
 use Test::More;
-use Thread::Subs (
-    attributes => 1,
-    );
+use Thread::Subs;
 
 my ($a, $name, %pool);
 
@@ -19,7 +17,7 @@ is($a->clim, 0, "Default clim");
 is($a->qlim, 0, "Default qlim");
 ok($a->shim, "Auto-shim by default");
 
-Thread::Subs->import(attributes => 'noshim');
+Thread::Subs->import('noshim');
 ok(eval <<'', "Declare sub with multiple attribute values");
 sub test2 :Thread(pool=test, clim=1,qlim=10) { 2 }
 1;
@@ -53,7 +51,7 @@ sub test7 { 7 }
 Thread::Subs::define {
     'main::test5' => { qlim => 5 },
     'main::test6' => { qlim => 6 },
-    'main::test7' => { qlim => 7},
+    'main::test7' => { qlim => 7 },
 };
 $a = Thread::Subs::_attr(\&test5);
 is($a->qlim, 5, "Hash-based multi-define");
@@ -98,6 +96,18 @@ is(0 + Thread::Subs::end_definitions(), 4, "Number of pools");
 eval { Thread::Subs::set_pool(INVALID => 1) };
 ok($@, "Invalid pool caught");
 
+is(Thread::Subs::signal(), 'CONT', "Default signal is CONT");
+is(Thread::Subs::signal('USR1'), 'USR1', "Changed signal to USR1");
+is(Thread::Subs::signal(''), '', "Disabled signal");
+eval { Thread::Subs::signal('X') };
+ok($@, "Invalid signal caught");
+
+is(Thread::Subs::endwait(), 0, "Default endwait is zero");
+is(Thread::Subs::endwait(2.5), 2.5, "Changed endwait to 2.5");
+eval { Thread::Subs::endwait(-1) };
+ok($@, "Invalid endwait caught");
+is(Thread::Subs::endwait(0), 0, "Changed endwait back to zero");
+
 eval { Thread::Subs::start_workers() };
 ok($@, "Start workers caught");
 
@@ -108,7 +118,7 @@ eval { Thread::Subs::startup() };
 ok($@, "Startup caught");
 
 is_deeply([Thread::Subs::running_workers()], [], "No running workers");
-is_deeply([Thread::Subs::current_tasks()], [], "No current tasks");
+is_deeply([Thread::Subs::current_tasks()],   [], "No current tasks");
 
 ok(eval { Thread::Subs::stop_workers(); 1 }, "Stop workers");
 
