@@ -9,12 +9,11 @@ my $THREADS = threads::posix->can('create') ? 'threads::posix' : 'threads';
 my $MAIN    = $THREADS->can('self') && $THREADS->self;
 
 package Thread::Subs;
-our $VERSION = '0.200';
+our $VERSION = '0.300';
 
 use threads::shared;
 use Scalar::Util qw(looks_like_number);
 use Sub::Util qw(set_subname subname);
-use Thread::Queue;
 use Thread::Semaphore;
 use Time::HiRes qw(time);
 
@@ -29,12 +28,20 @@ my %SHIM;          # per-package auto-shim setting
 my %CLIM  :shared; # per-sub concurrency limit Semaphore
 my %DEFER :shared; # per-sub array for concurrency limits
 my %QLIM  :shared; # per-sub queue limit Thread::Subs::lim
-my %REQ   :shared; # per-pool request Queues
+my %REQ   :shared; # per-pool request arrays
 my %SUB;           # all subs Thread::Subs::attr
 my %TASK  :shared; # per-thread current sub
 
 my $ENDWAIT = 0;
 my $STAGE   = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
+
+sub _enqueue {
+    my ($pool, $req) = @_;
+    my $queue = $REQ{$pool};
+    lock($queue);
+    push @$queue, $req;
+    cond_signal($queue);
+}
 
 # See start_workers for possible redefinition.
 sub _send_callback_signal {
@@ -217,20 +224,35 @@ sub _be_worker {
     my ($pool) = @_;
     my $tid = $THREADS->tid;
     #@! Worker $tid spawned for '$pool' pool
-    while (defined(my $work = $REQ{$pool}->dequeue)) {
-        my ($result, $sub, @arg) = @$work;
-        my $clim = $CLIM{$sub};
-        if ($clim) {
-            lock($clim); # exclusive on $clim and $DEFER{$sub}
-            unless ($clim->down_nb) {
-                #@! Request for $sub deferred due to concurrency limit
-                push @{$DEFER{$sub}}, $work;
-                next;
+    my $queue = $REQ{$pool};
+    my ($work, $result, $sub, @arg, $clim, $qlim);
+    while (1) {
+        do {
+            lock($queue);
+            cond_wait($queue) until @$queue;
+            unless ($queue->[0]) {
+                cond_signal($queue);
+                last;
             }
-        }
+            # Take from the head of @$queue and check concurrency
+            # limits while holding the lock.  This ensures correct
+            # sequential execution order for clim=1 subs.
+            $work = shift @$queue;
+            cond_signal($queue) if @$queue;
+            ($result, $sub, @arg) = @$work;
+            $clim = $CLIM{$sub};
+            if ($clim) {
+                lock($clim); # exclusive on $clim and $DEFER{$sub}
+                unless ($clim->down_nb) {
+                    #@! Request for $sub deferred due to concurrency limit
+                    push @{$DEFER{$sub}}, $work;
+                    next;
+                }
+            }
+        };
         #@! Worker $tid started $sub
         $TASK{"$tid-$pool"} = $sub;
-        my $qlim = $QLIM{$sub};
+        $qlim = $QLIM{$sub};
         while ($work) {
             undef $work;
             $qlim->out if $qlim;
@@ -278,7 +300,7 @@ sub start_workers {
     for my $pool (keys %POOL) {
         my $count = $POOL{$pool};
         #@! Starting '$pool' worker pool ($count)
-        $REQ{$pool} = Thread::Queue->new;
+        $REQ{$pool} = shared_clone([]);
         for (1..$count) {
             my $tid = $THREADS->create(\&_be_worker, $pool)->tid;
             $TASK{"$tid-$pool"} = '';
@@ -299,10 +321,12 @@ sub shim {
     my $pool = $attr->pool;
     my $qlim = $QLIM{$sub};
     return sub {
+        _die("BUG: shim for $sub called after workers stopped")
+            unless $STAGE < 4;
         #@! Requesting $sub pool=$pool @{[$qlim ? 'qlim='.$qlim->slack : '']}
         my $res = Thread::Subs::result->new;
         $qlim->in if $qlim; # can block
-        $REQ{$pool}->enqueue(shared_clone([$res, $sub, @_]));
+        _enqueue($pool, shared_clone([$res, $sub, @_]));
         $res->fatal("Exception in sub '$sub'")
             unless defined(wantarray) or $THREADS->tid;
         return $res;
@@ -348,7 +372,7 @@ sub stop_workers {
         $STAGE = 4;
         for (keys %REQ) {
             #@! Shutting down $_ worker pool
-            $REQ{$_}->end;
+            _enqueue($_, undef);
         }
     }
     return;
@@ -376,6 +400,14 @@ sub stop_and_wait {
 }
 
 sub current_tasks { &running_workers; return %TASK }
+
+sub queue_length {
+    my %len;
+    my $tot = 0;
+    $tot += $len{$_} = scalar(@{$REQ{$_}})
+        for keys %REQ;
+    return wantarray ? %len : $tot;
+}
 
 END {
     #@! END: Shutting down workers
@@ -519,16 +551,20 @@ sub _set {
     my $self = shift;
     my $args = shared_clone([@_]);
     my $cb;
-    {
+    do {
         lock($self);
         $cb = !$self->[0] && $self->[1];
         @$self = @$args;
         cond_broadcast($self);
-    }
+        # If this needs to go in the callback queue, do it now while
+        # we hold the lock.  Anything waiting on it can then run the
+        # queue immediately after unblocking to force the callback.
+        _push_cbq($self)
+            if $cb and $MAIN and $THREADS->tid;
+    };
     if ($cb) {
         if ($MAIN and $THREADS->tid) {
-            # Wrong thread: enqueue and maybe signal
-            _push_cbq($self);
+            # Wrong thread: maybe signal
             &Thread::Subs::_send_callback_signal
                 if $SIG && !$CBF;
         }
@@ -696,8 +732,8 @@ early in the process lifecycle and persist until shut down.  You can
 decide how many workers and pools you want.  Dynamic pool adjustment
 is not available: static pools are used for simplicity and efficiency.
 
-Each worker pool is associated with a L<Thread::Queue> object into
-which requests are enqueued; workers take from the head of this queue
+Each worker pool is associated with a queue (a shared array) into
+which requests are inserted; workers take from the head of this queue
 when ready.  Insertion into the queue is subject to an optional "qlim"
 limit which can cause the request to block.  Execution is also subject
 to optional concurrency limits, and requests will be placed into a
@@ -973,11 +1009,11 @@ after the workers start if true.  See L</"SIGNALS"> for more detail.
 This function is permitted in stages zero and one; if called in stage
 zero it calls C<end_definitions()> on your behalf to commence stage
 one.  It then spawns all the threads in the worker pools, creates the
-associated L<Thread::Queue> objects, and installs the signal handler
-for callbacks (unless it is disabled).  When it returns, stage two has
-commenced.  The function takes no arguments and returns the same pool
-size data as C<set_pool()> and C<end_definitions()>, except that it's
-final this time and reflects what's actually running.
+associated queue arrays, and installs the signal handler for callbacks
+unless it is disabled.  When it returns, stage two has commenced.  The
+function takes no arguments and returns the same pool size data as
+C<set_pool()> and C<end_definitions()>, except that it's final this
+time and reflects what's actually running.
 
 =head2 startup
 
@@ -1095,6 +1131,16 @@ and sub-name pairs.  The ID is a combination of the thread ID and the
 pool name ("$tid-$pool").  Idle workers have an empty string for the
 sub name.  May be called at any time.
 
+=head2 queue_length
+
+    %length = Thread::Subs::queue_length();
+    $total  = Thread::Subs::queue_length();
+
+Provides a snapshot of the current state of request queues.  In a list
+context returns pool name and queue length pairs; in a scalar context
+returns the sum of all queue lengths.  List results will be empty if
+called prior to starting workers.
+
 =head1 RESULTS
 
 The "result" sub-object (Thread::Subs::result) is returned by the shim
@@ -1136,6 +1182,11 @@ available.  This module reduces the use of signals by not sending them
 while the main thread is actively processing the callback queue, but
 one should still keep the contents of a callback to the same basics
 which are suitable in a signal handler.
+
+There is no particular guarantee as to when a callback will run once
+the result is ready, but it is guaranteed that the callback is queued
+for execution or already executed by the time the result is ready.
+You can force execution using L</"run_callback_queue">.
 
 Once you've set a callback, you are not obliged to keep the $result
 object: it will be kept alive by the worker thread which is providing
