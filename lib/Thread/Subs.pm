@@ -555,12 +555,12 @@ sub _set {
         lock($self);
         $cb = !$self->[0] && $self->[1];
         @$self = @$args;
-        cond_broadcast($self);
         # If this needs to go in the callback queue, do it now while
         # we hold the lock.  Anything waiting on it can then run the
         # queue immediately after unblocking to force the callback.
         _push_cbq($self)
             if $cb and $MAIN and $THREADS->tid;
+        cond_broadcast($self);
     };
     if ($cb) {
         if ($MAIN and $THREADS->tid) {
@@ -578,10 +578,8 @@ sub croak { shift()->_set(-1, @_) }
 
 sub data {
     my ($self) = @_;
-    unless ($self->[0]) {
-        lock($self);
-        cond_wait(@$self) until $self->[0];
-    }
+    lock($self);
+    cond_wait($self) until $self->[0];
     my (undef, @data) = @$self;
     return wantarray ? @data : $data[0];
 }
