@@ -21,15 +21,17 @@ sub dies :Thread { nap(5); die "@_\n" }
 my ($f, $x);
 Thread::Subs::startup(5);
 
-$f = test(2)->future;
+$x = test(2);
+$f = $x->future;
 ok(!$f->is_ready, "Not ready yet");
-test(2)->data; # delay
+$x->data; # block
+$x->run_callback_queue; # force callback
 ok($f->is_ready, "Ready now");
 is($f->get, 2, "Future resolved as expected");
 
 $f = dies('KABOOM')->future;
 ok(!$f->is_ready, "Not ready yet");
-dies('ignore')->data; # delay
+nap(1) until $f->is_ready;
 eval { $f->get };
 like($@, qr/KABOOM/, "Future dies as expected");
 ok($f->is_failed, "Future is failed");

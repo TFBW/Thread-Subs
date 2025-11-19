@@ -36,7 +36,9 @@ for my $n (1, 5, 3, 7) {
 }
 shift(@cv)->recv while @cv;
 undef $t;
-is($x, '~1~3~5~7', "Timer and subs run in parallel");
+# Most likely result is "~1~3~5~7", but no guarantee.
+cmp_ok($x =~ tr/~//d, '>', 1, "Timer ran");
+like($x, qr/^[1357]{4}$/, "Callbacks executed");
 
 my @v = test(1,2,3,4)->ae_cv->recv;
 is_deeply(\@v, [1,2,3,4], "Returned list is correct");

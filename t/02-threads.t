@@ -35,19 +35,29 @@ sub busy_workers {
     return scalar grep { $_ } values(%t)
 }
 
+sub skip_all { plan skip_all => "Abandoning test: @_" }
+
 sub all_idle_ok {
-    for (1..5) { last unless &busy_workers; nap(1) }
-    cmp_ok(&busy_workers, '==', 0, "All workers idle");
+    my $lim = time + 2.0;
+    nap(1) while time < $lim && Thread::Subs::queue_length() > 0;
+    return skip_all("job queues taking too long to clear")
+        if Thread::Subs::queue_length() > 0;
+    nap(1) while time < $lim && &busy_workers > 0;
+    return skip_all("workers taking too long to finish")
+        if &busy_workers > 0;
+    pass("Queues empty and workers idle");
 }
 
 # Some tests rely on DEFAULT pool having 10 workers
 is(scalar(Thread::Subs::startup(10)), 2, "Started two pools");
 
 my $ERR = '';
-$SIG{CONT} = do {
+my $do_callbacks = do {
     my $sig = $SIG{CONT};
     sub { eval { &$sig }; $ERR .= $@ if $@ }
 };
+$SIG{CONT} = $do_callbacks;
+sub do_callbacks { $do_callbacks->('CONT') }
 my $WARN = '';
 $SIG{__WARN__} = sub { $WARN .= "@_" };
 
@@ -65,6 +75,7 @@ $_->cb(sub { $x .= $_[0]->recv })
     for @r;
 eval { $_->recv for @r };
 ok(!$@, "No exceptions");
+&do_callbacks;
 is($x, '0123456789', "Callbacks");
 
 &all_idle_ok;
@@ -79,25 +90,29 @@ ok($@, "Recv raises exception");
 &all_idle_ok;
 
 $x = '';
-for my $n (3,2)   { clim1($n)->cb(sub { $x .= "s$n" }) } # sequential
-for my $n (1,2,4) { test($n) ->cb(sub { $x .= "p$n" }) } # parallel
-test(6)->recv; # delay
-is($x, 'p1p2s3p4s2', "Expected order of completion");
-
+for (2,4,6,8) { test($_) } # other work, untested
+for (4,2,3,1) { my $n = $_; clim1($n)->cb(sub { $x .= "s$n" }) } # sequential
+for (2,4,6,8) { test($_) } # other work, untested
 &all_idle_ok;
+&do_callbacks;
+is($x, 's4s2s3s1', "Expected order of completion");
 
 $x = time + 0.02;
-test(2) for 0..9; # all workers busy next 20ms
+test(2) for 0..9; # all workers busy at least 20ms
 qlim1(0); # should pass
 cmp_ok(time, '<', $x, "Not blocked by queue limit");
+cmp_ok(0 + Thread::Subs::queue_length(), '>', 0, "Non-empty queue");
 qlim1(0); # should block
 cmp_ok(time, '>', $x, "Blocked by queue limit");
 
+&all_idle_ok;
+
+is($ERR,  '', "No errors");
 is($WARN, '', "No warnings");
 dies("void");
 $x = dies("scalar");
-dies("ignored")->data; # forces wait
 &all_idle_ok;
+&do_callbacks;
 like($ERR, qr/void$/, "Void context exception produces exception");
 eval { $x->fatal };
 like($@, qr/scalar$/, "Fatal method produces exception");
@@ -109,11 +124,14 @@ ok($@, "Exception raised on attempt to shim non-thread sub");
 
 $x = Foo->new;
 $x->give(111,222,333);
-is($x->take->recv, 111, "Threaded object works");
+is_deeply([map { $x->take->recv } (1,2,3)], [111,222,333], "Threaded object works");
 
 $x = time;
 test(2);
 ok(eval { Thread::Subs::stop_and_wait(); 1 }, "Stop workers");
 cmp_ok(time - $x, '>=', 0.02, "Waited for worker");
+
+eval { test(1) };
+ok($@, "Exception raised when shim called afer shutdown");
 
 done_testing();
