@@ -1,7 +1,7 @@
 use 5.010;
 use strict;
 use warnings;
-use if $ENV{DEBUG} => 'Debug::Comments';
+use if $ENV{DEBUG_THREAD_SUBS} => 'Debug::Comments';
 
 my $DEFAULT = 'DEFAULT'; # default pool name
 my $SIG     = 'CONT';
@@ -14,7 +14,6 @@ our $VERSION = '0.300';
 use threads::shared;
 use Scalar::Util qw(looks_like_number);
 use Sub::Util qw(set_subname subname);
-use Thread::Semaphore;
 use Time::HiRes qw(time);
 
 #our @CARP_NOT; # TODO: tune for effective error messages
@@ -25,7 +24,7 @@ sub _nap { select(undef, undef, undef, 0.05) }
 
 my %POOL;          # per-pool worker count
 my %SHIM;          # per-package auto-shim setting
-my %CLIM  :shared; # per-sub concurrency limit Semaphore
+my %CLIM  :shared; # per-sub concurrency limit Thread::Subs::sem
 my %DEFER :shared; # per-sub array for concurrency limits
 my %QLIM  :shared; # per-sub queue limit Thread::Subs::lim
 my %REQ   :shared; # per-pool request arrays
@@ -91,13 +90,14 @@ sub import {
 sub _name {
     my ($sub) = @_;
     $sub = subname($sub) if ref $sub;
+    _die("Sub has no name") unless $sub; # Possible in v5.10
     no strict 'refs';
     _die("Sub '$sub' does not exist")
         unless exists &$sub;
     return $sub;
 }
 
-sub _attr { %SUB{&_name} } # used by t/01-nothreads.t
+sub _attr { $SUB{&_name} } # used by t/01-nothreads.t
 
 sub _define_one {
     _die("Too late to define sub attributes")
@@ -114,7 +114,7 @@ sub _define_one {
         $attr->$_($val);
     }
     if ($attr->clim) {
-        $CLIM{$sub} = Thread::Semaphore->new($attr->clim);
+        $CLIM{$sub} = Thread::Subs::sem->new($attr->clim);
         $DEFER{$sub} = shared_clone([]);
     }
     else {
@@ -205,7 +205,7 @@ sub set_pool {
             if $count =~ /\D/ or $count < 1;
         $POOL{$pool} = $count;
     }
-    return wantarray ? %POOL : scalar(keys %POOL);
+    return &end_definitions;
 }
 
 sub signal {
@@ -309,7 +309,7 @@ sub start_workers {
     #@! @{[$SIG ? "Using $SIG signal" : "No handler"]} for callbacks
     $SIG{$SIG} = \&Thread::Subs::result::run_callback_queue
         if $SIG;
-    return wantarray ? %POOL : scalar(keys %POOL);
+    return &end_definitions;
 }
 
 sub shim {
@@ -354,7 +354,7 @@ sub startup {
     &set_pool if @_;
     my %pool = &start_workers;
     &deploy_shims;
-    return %pool;
+    return &end_definitions;
 }
 
 sub endwait {
@@ -433,6 +433,29 @@ sub qlim { @_ == 1 ? $_[0][2] || 0        : do { $_[0][2] = $_[1]; $_[0] } }
 sub shim { @_ == 1 ? !!$_[0][3]           : do { $_[0][3] = $_[1]; $_[0] } }
 
 
+package Thread::Subs::sem;
+
+use threads::shared;
+
+# Minimalist reimplementation of Thread::Semaphore.  No locking; the
+# only user is _be_worker, which does its own lock management.
+
+sub new {
+    my $sem :shared = $_[1];
+    return bless \$sem;
+}
+
+sub down_nb {
+    my ($sem) = @_;
+    return $$sem > 0 ? do { --$$sem; 1 } : 0;
+}
+
+sub up {
+    my ($sem) = @_;
+    ++$$sem;
+}
+
+
 package Thread::Subs::lim;
 
 use threads::shared;
@@ -445,10 +468,14 @@ use threads::shared;
 sub new {
     my ($class, $lim) = @_;
     my @self :shared = (0, $lim);
-    return bless(\@self, ref($class)||$class);
+    return bless \@self;
 }
 
-sub slack { $_[0][1] - $_[0][0] }
+sub slack {
+    my ($self) = @_;
+    lock($self);
+    return $self->[1] - $self->[0];
+}
 
 sub in {
     my ($self) = @_;
@@ -947,6 +974,12 @@ the L</"deploy_shims"> function should redefine it.  This parameter is
 implicitly true for attribute-defined functions unless the import
 option "noshim" was specified.
 
+Note that C<define()> always overrides any previous definition, which
+includes definitions from sub attributes.  Only the parameters which
+are specified change: other parameters retain existing values, so
+partial redefinition is possible.  There is no symmetric "undefine"
+mechanism which restores defaults or makes the sub non-threaded.
+
 =head2 end_definitions
 
     %pool = Thread::Subs::end_definitions();
@@ -1310,10 +1343,10 @@ exception reason.  Returns self.
 
 =head1 SIGNALS
 
-As mentioned in the documentation for L</"signal"> function and the
-L</"run_callback_queue"> function, result callbacks require the use of
-a signal to execute callbacks in the main thread.  This is the 'CONT'
-signal unless specified otherwise.
+As mentioned in the documentation for the L</"signal"> function and
+the L</"run_callback_queue"> function, result callbacks require the
+use of a signal to execute callbacks in the main thread.  This is the
+'CONT' signal unless specified otherwise.
 
 'CONT' is a slightly cheeky choice of signal as the default: given the
 standard meaning of 'CONT' (resume if stopped), it would normally be
@@ -1581,7 +1614,8 @@ sugar, but it is more appropriate if you need dynamic worker pools.
 
 This module contains comments suitable for L<Debug::Comments>.  If you
 want debug output which shows dispatching and callback activity, you
-can produce it if you have this module available.
+can produce it if L<Debug::Comments> is available and the environment
+variable "DEBUG_THREAD_SUBS" is set to a true value.
 
 =head1 LICENSE AND COPYRIGHT
 
