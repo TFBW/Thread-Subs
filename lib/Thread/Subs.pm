@@ -223,6 +223,7 @@ sub signal {
 sub _be_worker {
     my ($pool) = @_;
     my $tid = $THREADS->tid;
+    my $set_sub = sub { lock(%TASK); $TASK{"$tid-$pool"} = $_[0]//'' };
     #@! Worker $tid spawned for '$pool' pool
     my $queue = $REQ{$pool};
     my ($work, $result, $sub, @arg, $clim, $qlim);
@@ -251,7 +252,7 @@ sub _be_worker {
             }
         };
         #@! Worker $tid started $sub
-        $TASK{"$tid-$pool"} = $sub;
+        $set_sub->($sub);
         $qlim = $QLIM{$sub};
         while ($work) {
             undef $work;
@@ -269,7 +270,7 @@ sub _be_worker {
             }
         }
         #@! Worker $tid finished $sub
-        $TASK{"$tid-$pool"} = '';
+        $set_sub->();
     }
     #@! Worker $tid exits
     return;
@@ -297,6 +298,7 @@ sub start_workers {
             };
         }
     }
+    lock(%TASK);
     for my $pool (keys %POOL) {
         my $count = $POOL{$pool};
         #@! Starting '$pool' worker pool ($count)
@@ -380,6 +382,7 @@ sub stop_workers {
 
 sub running_workers {
     my @thr;
+    lock(%TASK);
     for (keys %TASK) {
         if (my $t = $THREADS->object(/^(\d+)/)) {
             if    ($t->is_joinable) { $t->join; delete $TASK{$_} }
@@ -399,13 +402,15 @@ sub stop_and_wait {
     return;
 }
 
-sub current_tasks { &running_workers; return %TASK }
+sub current_tasks { lock(%TASK); &running_workers; return %TASK }
 
 sub queue_length {
-    my %len;
+    my ($q, %len);
     my $tot = 0;
-    $tot += $len{$_} = scalar(@{$REQ{$_}})
-        for keys %REQ;
+    for (keys %REQ) {
+        $q = $REQ{$_};
+        $tot += $len{$_} = do { lock($q); scalar(@$q) };
+    }
     return wantarray ? %len : $tot;
 }
 
@@ -441,8 +446,8 @@ use threads::shared;
 # only user is _be_worker, which does its own lock management.
 
 sub new {
-    my $sem :shared = $_[1];
-    return bless \$sem;
+    my ($class, $sem) = @_;
+    return bless shared_clone(\$sem);
 }
 
 sub down_nb {
@@ -467,8 +472,7 @@ use threads::shared;
 
 sub new {
     my ($class, $lim) = @_;
-    my @self :shared = (0, $lim);
-    return bless \@self;
+    return bless shared_clone([0, $lim]);
 }
 
 sub slack {
@@ -510,20 +514,13 @@ my @CBQ :shared; # call-back queue (ready)
 my $CBF :shared; # call-back flag (do not signal when true)
 
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
-sub _push_cbq  { lock(@CBQ); push @CBQ, @_ }
-sub _flush_cbq { lock(@CBQ); my @q = @CBQ; @CBQ = (); return @q }
 
 END {
     #@! END: Cancel remaining callbacks (@{[scalar keys %CB]})
-    $CBF = 1; # No more signals
-    @CBQ = %CB = ();
+    %CB = ();
 }
 
-sub new {
-    my ($class) = @_;
-    my @self :shared = 0;
-    return bless(\@self, ref($class)||$class);
-}
+sub new { bless shared_clone([0]) }
 
 sub _id { $MAIN ? is_shared($_[0]) // _die("BUG: result object not shared") : refaddr($_[0]) }
 
@@ -542,12 +539,16 @@ sub _callback {
 sub run_callback_queue {
     _die("BUG: result callbacks must be invoked in the main thread")
         if $MAIN and $THREADS->tid;
-    $CBF = 1; # Suppress signals
     #@! Invoking callbacks
     my $n = 0;
-    while (@CBQ) { for (&_flush_cbq) { $n++; $_->_callback } }
-    $CBF = 0; # Enable signals, then catch residuals
-    for (&_flush_cbq ) { $n++; $_->_callback }
+    my $cb;
+    $CBF = 1; # Suppress signals
+    while ($CBF) {
+        if ($cb = do { lock(@CBQ); @CBQ > 0 ? shift @CBQ : ($CBF = 0) }) {
+            $n++;
+            $cb->_callback;
+        }
+    }
     #@! Callback processing complete ($n)
     return;
 }
@@ -585,8 +586,7 @@ sub _set {
         # If this needs to go in the callback queue, do it now while
         # we hold the lock.  Anything waiting on it can then run the
         # queue immediately after unblocking to force the callback.
-        _push_cbq($self)
-            if $cb and $MAIN and $THREADS->tid;
+        if ($cb and $MAIN and $THREADS->tid) { lock(@CBQ); push @CBQ, $self }
         cond_broadcast($self);
     };
     if ($cb) {
