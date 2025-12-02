@@ -1,6 +1,5 @@
 #!perl
-use 5.010;
-use strict;
+use 5.012;
 use warnings;
 use Test::More;
 use Thread::Subs;
@@ -11,6 +10,7 @@ ok(eval <<'', "Declare sub with Thread attribute");
 sub test1 :Thread { 1 }
 1;
 
+diag($@) if $@;
 ok($a = Thread::Subs::_attr(\&test1), "Sub has attributes");
 is($a->pool, 'DEFAULT', "Default pool");
 is($a->clim, 0, "Default clim");
