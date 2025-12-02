@@ -1,6 +1,5 @@
 #!perl
-use 5.010;
-use strict;
+use 5.012;
 use warnings;
 use threads;
 use threads::shared;
@@ -39,6 +38,8 @@ my $p = Mojo::Promise->all(
     );
 $p->ioloop->recurring(0.02 => sub { $x .= '~' });
 $p->wait;
-is($x, '~1~3~5~7', "Timer and subs run in parallel");
+# Most likely result is "~1~3~5~7", but no guarantee
+cmp_ok($x =~ tr/~//d, '>', 1, "Timer ran");
+like($x, qr/^[1357]{4}$/, "Callbacks executed");
 
 done_testing();

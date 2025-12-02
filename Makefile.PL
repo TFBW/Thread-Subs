@@ -9,7 +9,7 @@ my %WriteMakefileArgs = (
     VERSION_FROM     => 'lib/Thread/Subs.pm',
     ABSTRACT_FROM    => 'lib/Thread/Subs.pm',
     LICENSE          => 'perl_5',
-    MIN_PERL_VERSION => '5.010',
+    MIN_PERL_VERSION => '5.012',
     CONFIGURE_REQUIRES => {
         'ExtUtils::MakeMaker' => '0',
     },
@@ -20,7 +20,6 @@ my %WriteMakefileArgs = (
         'threads::shared'   => '1.21',
         'Scalar::Util'      => '1.10',
         'Sub::Util'         => '1.40',
-        'Thread::Semaphore' => '2.11',
         'Time::HiRes'       => '0',
     },
     dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
