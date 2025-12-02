@@ -1,6 +1,5 @@
 #!perl
-use 5.010;
-use strict;
+use 5.012;
 use warnings;
 BEGIN { eval("use threads") or $::ERR = $@ }
 use threads::shared;
@@ -16,10 +15,12 @@ use Time::HiRes qw(time);
 
 sub nap { select(undef, undef, undef, $_[0] * 0.01); return @_ }
 
-sub test  :Thread         { &nap }
-sub dies  :Thread         { nap(5); die "@_\n" }
-sub clim1 :Thread(clim=1) { &nap }
-sub qlim1 :Thread(qlim=1) { &nap }
+sub test  :Thread                { &nap }
+sub dies  :Thread                { nap(5); die "@_\n" }
+sub clim1 :Thread(clim=1)        { &nap }
+sub qlim1 :Thread(qlim=1)        { &nap }
+sub both  :Thread(clim=1 qlim=1) { &nap }
+sub t2t   :Thread                { Thread::Subs::shim(\&test)->(@_)->recv }
 
 {
     package Foo;
@@ -30,22 +31,18 @@ sub qlim1 :Thread(qlim=1) { &nap }
     sub take :Thread(clim=1 pool=PKG) { return shift @{$_[0]} }
 }
 
-sub busy_workers {
-    my %t = &Thread::Subs::current_tasks;
-    return scalar grep { $_ } values(%t)
-}
+sub both_slack { Thread::Subs::queue_slack('main::both') }
 
 sub skip_all { plan skip_all => "Abandoning test: @_" }
 
 sub all_idle_ok {
     my $lim = time + 2.0;
-    nap(1) while time < $lim && Thread::Subs::queue_length() > 0;
-    return skip_all("job queues taking too long to clear")
-        if Thread::Subs::queue_length() > 0;
-    nap(1) while time < $lim && &busy_workers > 0;
-    return skip_all("workers taking too long to finish")
-        if &busy_workers > 0;
-    pass("Queues empty and workers idle");
+    while (time < $lim) {
+        return pass("Queues empty and workers idle")
+            if Thread::Subs::is_idle();
+        nap(1);
+    }
+    return skip_all("workers taking too long to finish");
 }
 
 # Some tests rely on DEFAULT pool having 10 workers
@@ -69,14 +66,14 @@ is($x, '0-1-2-3-4-5-6-7-8-9', "Blocking recv");
 
 &all_idle_ok;
 
-$x = '';
+$x = 0;
 @r = map { test(9 - $_) } 0..9;
-$_->cb(sub { $x .= $_[0]->recv })
+$_->cb(sub { $x++ })
     for @r;
 eval { $_->recv for @r };
 ok(!$@, "No exceptions");
 &do_callbacks;
-is($x, '0123456789', "Callbacks");
+is($x, 10, "Callbacks");
 
 &all_idle_ok;
 
@@ -97,12 +94,13 @@ for (2,4,6,8) { test($_) } # other work, untested
 &do_callbacks;
 is($x, 's4s2s3s1', "Expected order of completion");
 
-$x = time + 0.02;
-test(2) for 0..9; # all workers busy at least 20ms
-qlim1(0); # should pass
-cmp_ok(time, '<', $x, "Not blocked by queue limit");
-cmp_ok(0 + Thread::Subs::queue_length(), '>', 0, "Non-empty queue");
-qlim1(0); # should block
+cmp_ok(&both_slack, '==', 1, "Not blocked by queue limit");
+$x = time + 0.05;
+both(5); # should pass
+test(2) for 1..4; # other work, untested
+both(1); # should pass but remain in queue
+cmp_ok(&both_slack, '==', 0, "Queue limit reached");
+both(1); # should block until second both() starts
 cmp_ok(time, '>', $x, "Blocked by queue limit");
 
 &all_idle_ok;
@@ -121,6 +119,8 @@ like($WARN, qr/scalar$/, "Warn method produces warning");
 
 eval { Thread::Subs::shim(\&nap) };
 ok($@, "Exception raised on attempt to shim non-thread sub");
+
+is(t2t(2)->recv, 2, "Thread to thread");
 
 $x = Foo->new;
 $x->give(111,222,333);
