@@ -1,5 +1,4 @@
-use 5.010;
-use strict;
+use 5.012;
 use warnings;
 use if $ENV{DEBUG_THREAD_SUBS} => 'Debug::Comments';
 
@@ -250,9 +249,9 @@ sub _be_worker {
                     next;
                 }
             }
+            #@! Worker $tid started $sub
+            $set_sub->($sub);
         };
-        #@! Worker $tid started $sub
-        $set_sub->($sub);
         $qlim = $QLIM{$sub};
         while ($work) {
             undef $work;
@@ -344,7 +343,7 @@ sub deploy_shims {
     for (grep { $SUB{$_}->shim } keys %SUB) {
         no strict 'refs';
         no warnings 'redefine';
-        *{$_} = set_subname($_, shim($_));
+        *{$_} = set_subname("$_<shim>", shim($_));
         #@! Deployed shim for $_
     }
     return;
@@ -404,14 +403,29 @@ sub stop_and_wait {
 
 sub current_tasks { lock(%TASK); &running_workers; return %TASK }
 
-sub queue_length {
-    my ($q, %len);
-    my $tot = 0;
-    for (keys %REQ) {
-        $q = $REQ{$_};
-        $tot += $len{$_} = do { lock($q); scalar(@$q) };
+sub queue_slack {
+    if (@_) {
+        my $sub = &_name;
+        return exists($QLIM{$sub}) ? $QLIM{$sub}->slack : undef;
     }
-    return wantarray ? %len : $tot;
+    my %q;
+    $q{$_} = $QLIM{$_}->slack
+        for keys %QLIM;
+    return %q;
+}
+
+sub is_idle {
+    return if $STAGE < 2;
+    _die("No such pool '$_'")
+        for grep { !$REQ{$_} } @_;
+    my @pool = @_ ? @_ : keys(%REQ);
+    lock($_) for map { $REQ{$_} } @pool;
+    return 0 if grep { @{$REQ{$_}} > 0 } @pool;
+    my $pools = join('|', map { quotemeta($_) } @pool);
+    lock(%TASK);
+    return 0
+        for grep { $TASK{$_} and /-($pools)$/ } keys %TASK;
+    return 1;
 }
 
 END {
@@ -1162,15 +1176,30 @@ and sub-name pairs.  The ID is a combination of the thread ID and the
 pool name ("$tid-$pool").  Idle workers have an empty string for the
 sub name.  May be called at any time.
 
-=head2 queue_length
+=head2 queue_slack
 
-    %length = Thread::Subs::queue_length();
-    $total  = Thread::Subs::queue_length();
+    $slack = Thread::Subs::queue_slack($sub);
+    %slack = Thread::Subs::queue_slack();
 
-Provides a snapshot of the current state of request queues.  In a list
-context returns pool name and queue length pairs; in a scalar context
-returns the sum of all queue lengths.  List results will be empty if
-called prior to starting workers.
+Provides a snapshot of the current state of queue limits.  Where a
+$sub is specified, returns the current $slack in the queue for that
+$sub, or undef if it has no queue limit.  The $slack is the number of
+requests which can still be made without blocking.  This can be zero
+or even negative (meaning that something is currently blocked).  Where
+no $sub is specified, returns a list of name-value pairs for all subs
+with a queue limit and their current slack.
+
+=head2 is_idle
+
+    $bool = Thread::Subs::is_idle(@pools);
+
+Returns true if the queues for all specified @pools are empty, and the
+associated workers are idle.  If @pools is an empty list, all pools
+are checked.  This is not a lightweight operation: all the associated
+request queues must be locked while checked.  An exception is raised
+if @pools contains a non-existent pool name.  The function returns
+undef immediately with no further checking if workers have not been
+started yet.
 
 =head1 RESULTS
 
