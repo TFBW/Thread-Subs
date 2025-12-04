@@ -129,6 +129,7 @@ is_deeply([map { $x->take->recv } (1,2,3)], [111,222,333], "Threaded object work
 $x = time;
 test(2);
 ok(eval { Thread::Subs::stop_and_wait(); 1 }, "Stop workers");
+diag($@) if $@;
 cmp_ok(time - $x, '>=', 0.02, "Waited for worker");
 
 eval { test(1) };
