@@ -49,7 +49,7 @@ sub test6 { 6 }
 sub test7 { 7 }
 
 Thread::Subs::define {
-    'main::test5' => { qlim => 5 },
+    'test5'       => { qlim => 5 },
     'main::test6' => { qlim => 6 },
     'main::test7' => { qlim => 7 },
 };
