@@ -31,7 +31,9 @@ my %SUB;           # all subs Thread::Subs::attr
 my %TASK  :shared; # per-thread current sub
 
 my $ENDWAIT = 0;
-my $STAGE   = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
+my $STAGE :shared = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
+
+our $Caller; # For _name() qualification
 
 sub _enqueue {
     my ($pool, $req) = @_;
@@ -88,8 +90,8 @@ sub import {
 
 sub _name {
     my ($sub) = @_;
-    $sub = subname($sub) if ref $sub;
-    _die("Sub has no name") unless $sub; # Possible in v5.10
+    if (ref $sub) { $sub = subname($sub) // _die("Sub has no name") }
+    elsif ($Caller and $sub !~ /:/) { $sub = "${Caller}::$sub" }
     no strict 'refs';
     _die("Sub '$sub' does not exist")
         unless exists &$sub;
@@ -126,6 +128,7 @@ sub _define_one {
 }
 
 sub define {
+    local $Caller = caller;
     if (@_ == 1 and ref($_[0]) eq 'HASH') {
         my ($hash) = @_;
         _define_one($_, $hash->{$_})
@@ -317,11 +320,12 @@ sub shim {
     _die("BUG: shim requested before workers started")
         if $STAGE < 2;
     my ($sub) = @_;
+    local $Caller = caller;
     $sub = _name($sub);
     my $attr = $SUB{$sub} or _die("BUG: '$sub' is not a threaded sub");
     my $pool = $attr->pool;
     my $qlim = $QLIM{$sub};
-    return sub {
+    return set_subname "$sub<shim>" => sub {
         _die("BUG: shim for $sub called after workers stopped")
             unless $STAGE < 4;
         #@! Requesting $sub pool=$pool @{[$qlim ? 'qlim='.$qlim->slack : '']}
@@ -337,13 +341,13 @@ sub shim {
 sub deploy_shims {
     _die("BUG: attempt to deploy shims at wrong stage (STAGE=$STAGE)")
         unless $STAGE == 2;
-    _die("BUG: attempted to deploy shims in a thread")
+    _die("BUG: attempt to deploy shims in a thread")
         if $THREADS->tid;
     $STAGE = 3;
     for (grep { $SUB{$_}->shim } keys %SUB) {
         no strict 'refs';
         no warnings 'redefine';
-        *{$_} = set_subname("$_<shim>", shim($_));
+        *{$_} = shim($_);
         #@! Deployed shim for $_
     }
     return;
@@ -359,6 +363,8 @@ sub startup {
 }
 
 sub endwait {
+    _die("BUG: attempt to use endwait in a thread")
+        if $MAIN and $THREADS->tid;
     if (@_) {
         my ($t) = @_;
         _die("Invalid endwait '$t'")
@@ -393,6 +399,8 @@ sub running_workers {
 }
 
 sub stop_and_wait {
+    _die("BUG: attempt to stop_and_wait in a thread")
+        if $MAIN and $THREADS->tid;
     #@! Stopping and waiting for workers
     &stop_workers;
     &_nap while &running_workers;
@@ -404,6 +412,7 @@ sub stop_and_wait {
 sub current_tasks { lock(%TASK); &running_workers; return %TASK }
 
 sub queue_slack {
+    local $Caller = caller;
     if (@_) {
         my $sub = &_name;
         return exists($QLIM{$sub}) ? $QLIM{$sub}->slack : undef;
@@ -923,7 +932,7 @@ valid only in particular stages, as outlined below.
 
 Stage zero is available immediately after the module is imported, and
 is the stage where sub attributes are defined, either by the attribute
-mechanism or calls to C<define()>.
+mechanism or calls to C<define()> (or both).
 
 =item *
 
@@ -972,11 +981,15 @@ single call, but the all-in-one hashref approach can only identify
 functions by name because hash keys are necessarily strings.  The
 other approaches permit $sub to be either a string or a reference to
 the sub, but see L</"Quirks of Sub Names"> for caveats about using
-references.  Anonymous subs are not allowed because CODE references
-are not a thread-sharable data type: a request to execute a sub must
-refer to the sub by name.  Work around this by assigning anonymous
-subs to a glob, but bear in mind that this must occur before workers
-are started.  Names must include the package, e.g. "main::foo".
+references.  String-based names which do not include a colon will have
+the caller's package prepended.
+
+Anonymous subs are not allowed because CODE references are not a
+thread-sharable data type: a request to execute a sub must refer to
+the sub by name.  You can assign an anonymous sub to a glob, then use
+C<define()> on that name, but bear in mind that you can't dynamically
+alter the sub in this way: the worker threads see whatever code was in
+effect when they started.
 
 The %parameters are the same as the L</"ATTRIBUTES"> parameters with a
 couple of exceptions arising from the difference between attribute
@@ -1083,8 +1096,9 @@ $code ref which can be used to call $sub in a worker thread.  The $sub
 can be given as a name or as a reference, but it must have "Thread"
 attributes or have been the subject of an earlier C<define()> call.
 See L</"Quirks of Sub Names"> for caveats relating to the use of sub
-references.  An exception is raised if there is no such sub or it has
-not been defined as a Thread sub.
+references.  String-based names with no colon will have the caller's
+package prepended.  An exception is raised if there is no such sub or
+it has not been defined as a Thread sub.
 
 The specific parameters which affect the shim are "pool", which tells
 it where to send the request, and "qlim", which tells it to possibly
@@ -1096,6 +1110,10 @@ apply the L</"fatal"> method to the otherwise-ignored result object.
 This means that an exception thrown in the threaded sub can ultimately
 cause an exception in the main thread.  If this isn't the behaviour
 you want, handle the result object explicitly in some other way.
+
+The $code returned has its name property set to the original sub name
+appended with "<shim>".  This provides more context information in the
+Perl debugger than an anonymous sub.
 
 =head2 deploy_shims
 
@@ -1112,6 +1130,12 @@ L</"Shims"> for details and alternatives.  You are under no strict
 obligation to use this function, but it may be tidier than the
 alternative, which involves more explicit use of C<shim()>.
 
+Once a sub is replaced by its shim, you can't (in the main thread)
+pass a reference to the sub to C<shim()>: it's now the wrong code, and
+doesn't have the original name.  The reference to the sub I<is> the
+shim now.  Calling C<shim()> with the string-based name still works
+correctly, however.
+
 =head2 endwait
 
     $sec = Thread::Subs::endwait();
@@ -1120,6 +1144,7 @@ alternative, which involves more explicit use of C<shim()>.
 Gets and optionally sets the "endwait" period (in seconds), default
 zero.  Can be called in either form at any time, but $sec must be a
 numeric value of zero or more in set mode or an exception is raised.
+This function is only available in the main thread.
 
 When the process exits, some worker threads may still be running,
 either because the work takes a while or because there are still
@@ -1151,6 +1176,7 @@ called, and it is not possible to restart the workers once stopped.
 As per L</"stop_workers">, but does not return until all worker
 threads have exited and all callbacks have executed.  This is very
 convenient for simple scripts, but it can hang on a stuck worker.
+This function is only available in the main thread.
 
 =head2 running_workers
 
@@ -1185,9 +1211,11 @@ Provides a snapshot of the current state of queue limits.  Where a
 $sub is specified, returns the current $slack in the queue for that
 $sub, or undef if it has no queue limit.  The $slack is the number of
 requests which can still be made without blocking.  This can be zero
-or even negative (meaning that something is currently blocked).  Where
-no $sub is specified, returns a list of name-value pairs for all subs
-with a queue limit and their current slack.
+or even negative (meaning that something is currently blocked).  The
+semantics of $sub are as per L</"shim">.
+
+Where no $sub is specified, returns a list of name-value pairs for all
+subs with a queue limit and their current slack.
 
 =head2 is_idle
 
