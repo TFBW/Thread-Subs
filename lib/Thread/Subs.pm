@@ -15,8 +15,9 @@ use Scalar::Util qw(looks_like_number);
 use Sub::Util qw(set_subname subname);
 use Time::HiRes qw(time);
 
-#our @CARP_NOT; # TODO: tune for effective error messages
+our @CARP_NOT = qw(attributes);
 
+# If a _die message starts with "BUG", it's meant to be unreachable.
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 sub _bad { _die("Invalid Thread attribute: @_") }
 sub _nap { select(undef, undef, undef, 0.05) }
@@ -75,14 +76,14 @@ sub import {
     $SHIM{$caller} = 1;
     for (@_) {
         if ($_ eq 'noshim') { $SHIM{$caller} = 0 }
-        else { _die("Invalid $class import option: $_") }
+        else { _die("Invalid $class import option '$_'") }
     }
     return;
 }
 
 sub _name {
     my ($sub) = @_;
-    if (ref $sub) { $sub = subname($sub) // _die("Sub has no name") }
+    if (ref $sub) { $sub = subname($sub) // _die("BUG: sub has no name") }
     elsif ($Caller and $sub !~ /:/) { $sub = "${Caller}::$sub" }
     no strict 'refs';
     _die("Sub '$sub' does not exist")
@@ -186,16 +187,16 @@ sub end_definitions {
 
 sub set_pool {
     &end_definitions if $STAGE == 0;
-    _die("BUG: set_pool() called when workers already started")
+    _die("Thread::Subs::set_pool() called when workers already started")
         if $STAGE > 1;
     unshift @_, $DEFAULT
         if @_ == 1;
     while (@_) {
         my $pool = shift;
-        _die("No subs use worker pool '$pool'")
+        _die("No subs use '$pool' worker pool")
             unless exists $POOL{$pool};
         my $count = shift;
-        _die("Invalid worker count '$count' for pool '$pool'")
+        _die("Invalid worker count '$count' for '$pool' pool")
             if $count =~ /\D/ or $count < 1;
         $POOL{$pool} = $count;
     }
@@ -274,7 +275,7 @@ sub start_workers {
     _die("Can't start workers: threads not available")
         unless defined $MAIN;
     &end_definitions if $STAGE == 0;
-    _die("BUG: workers already started")
+    _die("Workers already started")
         if $STAGE > 1;
     $STAGE = 2;
     if ($SIG and $THREADS eq 'threads') {
@@ -309,17 +310,17 @@ sub start_workers {
 }
 
 sub shim {
-    _die("BUG: shim requested before workers started")
+    _die("Shim requested before workers started")
         if $STAGE < 2;
     my ($sub) = @_;
     local $Caller = caller;
     $sub = _name($sub);
-    my $attr = $SUB{$sub} or _die("BUG: '$sub' is not a threaded sub");
+    my $attr = $SUB{$sub} or _die("Can't shim non-thread sub '$sub'");
     my $pool = $attr->pool;
     my $qlim = $QLIM{$sub};
     my $queue = $REQ{$pool};
     return set_subname "$sub<shim>" => sub {
-        _die("BUG: shim for $sub called after workers stopped")
+        _die("Shim for '$sub' called after workers stopped")
             unless $STAGE < 4;
         #@! Requesting $sub pool=$pool @{[$qlim ? 'qlim='.$qlim->slack : '']}
         my $res = Thread::Subs::result->new;
@@ -334,9 +335,9 @@ sub shim {
 }
 
 sub deploy_shims {
-    _die("BUG: attempt to deploy shims at wrong stage (STAGE=$STAGE)")
+    _die("Attempt to deploy shims at wrong stage (STAGE=$STAGE)")
         unless $STAGE == 2;
-    _die("BUG: attempt to deploy shims in a thread")
+    _die("Attempt to deploy shims in a thread")
         if $THREADS->tid;
     $STAGE = 3;
     for (grep { $SUB{$_}->shim } keys %SUB) {
@@ -349,7 +350,7 @@ sub deploy_shims {
 }
 
 sub startup {
-    _die("Already started")
+    _die("Workers already started")
         if $STAGE > 1;
     &set_pool if @_;
     my %pool = &start_workers;
@@ -358,7 +359,7 @@ sub startup {
 }
 
 sub endwait {
-    _die("BUG: attempt to use endwait in a thread")
+    _die("Attempt to use endwait in a thread")
         if $MAIN and $THREADS->tid;
     if (@_) {
         my ($t) = @_;
@@ -395,10 +396,10 @@ sub running_workers {
 }
 
 sub stop_and_wait {
-    _die("BUG: attempt to stop_and_wait in a thread")
+    _die("Attempt to stop_and_wait in a thread")
         if $MAIN and $THREADS->tid;
-    #@! Stopping and waiting for workers
     &stop_workers;
+    #@! Waiting for workers
     &_nap while &running_workers;
     #@! All worker threads joined
     &Thread::Subs::result::run_callback_queue;
@@ -421,7 +422,7 @@ sub queue_slack {
 
 sub is_idle {
     return if $STAGE < 2;
-    _die("No such pool '$_'")
+    _die("No such worker pool '$_'")
         for grep { !$REQ{$_} } @_;
     my @pool = @_ ? @_ : keys(%REQ);
     lock($_) for map { $REQ{$_} } @pool;
@@ -434,18 +435,18 @@ sub is_idle {
 }
 
 END {
-    #@! END: Shutting down workers
+    #@! Thread::Subs END (ENDWAIT=$ENDWAIT)
     &stop_workers;
     my $lim = time + $ENDWAIT;
     while (&running_workers) {
         if (time < $lim) { &_nap }
         else {
-            #@! END: Detaching remaining workers
+            #@! Detaching remaining workers
             $_->detach for &running_workers;
             return;
         }
     }
-    #@! END: All threads joined
+    #@! Clean exit
 }
 
 
@@ -535,7 +536,7 @@ my $CBF :shared; # call-back flag (do not signal when true)
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
 END {
-    #@! END: Cancel remaining callbacks (@{[scalar keys %CB]})
+    #@! Thread::Subs::result END: Cancel callbacks (@{[scalar keys %CB]})
     %CB = ();
 }
 
@@ -556,7 +557,7 @@ sub _callback {
 }
 
 sub run_callback_queue {
-    _die("BUG: result callbacks must be invoked in the main thread")
+    _die("Callbacks must be executed in the main thread")
         if $MAIN and $THREADS->tid;
     #@! Invoking callbacks
     my $n = 0;
@@ -573,7 +574,7 @@ sub run_callback_queue {
 }
 
 sub cb {
-    _die("BUG: result cb method only available in the main thread")
+    _die("Thread::Subs::result cb method only available in the main thread")
         if $MAIN and $THREADS->tid;
     my ($self, $cb) = @_;
     my $id = $self->_id;
