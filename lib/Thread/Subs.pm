@@ -35,14 +35,6 @@ my $STAGE :shared = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
 
 our $Caller; # For _name() qualification
 
-sub _enqueue {
-    my ($pool, $req) = @_;
-    my $queue = $REQ{$pool};
-    lock($queue);
-    push @$queue, $req;
-    cond_signal($queue);
-}
-
 # See start_workers for possible redefinition.
 sub _send_callback_signal {
     #@! Sending $SIG via threads->kill
@@ -98,7 +90,7 @@ sub _name {
     return $sub;
 }
 
-sub _attr { $SUB{&_name} } # used by t/01-nothreads.t
+sub _attr { local $Caller = caller; $SUB{&_name} } # used by t/01-nothreads.t
 
 sub _define_one {
     _die("Too late to define sub attributes")
@@ -232,7 +224,7 @@ sub _be_worker {
     while (1) {
         do {
             lock($queue);
-            cond_wait($queue) until @$queue;
+            cond_wait($queue) until @$queue or $STAGE == 4;
             unless ($queue->[0]) {
                 cond_signal($queue);
                 last;
@@ -325,15 +317,18 @@ sub shim {
     my $attr = $SUB{$sub} or _die("BUG: '$sub' is not a threaded sub");
     my $pool = $attr->pool;
     my $qlim = $QLIM{$sub};
+    my $queue = $REQ{$pool};
     return set_subname "$sub<shim>" => sub {
         _die("BUG: shim for $sub called after workers stopped")
             unless $STAGE < 4;
         #@! Requesting $sub pool=$pool @{[$qlim ? 'qlim='.$qlim->slack : '']}
         my $res = Thread::Subs::result->new;
         $qlim->in if $qlim; # can block
-        _enqueue($pool, shared_clone([$res, $sub, @_]));
         $res->fatal("Exception in sub '$sub'")
             unless defined(wantarray) or $THREADS->tid;
+        lock($queue);
+        push @$queue, shared_clone([$res, $sub, @_]);
+        cond_signal($queue);
         return $res;
     };
 }
@@ -376,10 +371,11 @@ sub endwait {
 
 sub stop_workers {
     if ($STAGE < 4) {
+        #@! Stopping workers
         $STAGE = 4;
-        for (keys %REQ) {
-            #@! Shutting down $_ worker pool
-            _enqueue($_, undef);
+        for my $queue (values %REQ) {
+            lock(@$queue);
+            cond_signal(@$queue);
         }
     }
     return;
@@ -1171,6 +1167,10 @@ processing, with possible additional delay if L</"endwait"> was given
 a positive value.  The function effectively becomes a no-op once
 called, and it is not possible to restart the workers once stopped.
 
+If your code includes thread-to-thread calls, this operation might be
+disruptive because those calls will start to fail.  You may want to
+poll the L</"is_idle"> function before stopping workers in this case.
+
 =head2 stop_and_wait
 
 As per L</"stop_workers">, but does not return until all worker
@@ -1337,9 +1337,8 @@ a method if desired.  It is normally installed as the signal handler
 specified by the L</"signal"> function, but you'll need to make other
 arrangements if you've disabled it for some reason.  When called (from
 the main thread only), it executes callbacks on any ready results with
-an associated callback and clears the queue.  Any result objects with
-callbacks which become ready during this call will also be processed
-without the need for additional signals.
+an associated callback until the queue is empty.  Any result objects
+with callbacks which become ready during this call will be processed.
 
 =head2 Async Adaptors
 
@@ -1651,6 +1650,10 @@ blocks waiting for other workers is a potential source of deadlock,
 and it's on you to ensure the potential can't become reality.  This
 potential is amplified greatly if you call a sub with a "qlim" limit,
 so avoid that scenario unless you can prove it safe.
+
+Bear in mind that calls to shims start to fail when L</"stop_workers">
+is invoked, and this will impact thread-to-thread calls, so using this
+pattern is likely to add complexity to the shutdown process.
 
 =head1 SEE ALSO
 
