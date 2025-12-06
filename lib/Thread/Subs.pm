@@ -8,7 +8,7 @@ my $THREADS = threads::posix->can('create') ? 'threads::posix' : 'threads';
 my $MAIN    = $THREADS->can('self') && $THREADS->self;
 
 package Thread::Subs;
-our $VERSION = '0.300';
+our $VERSION = '0.400';
 
 use threads::shared;
 use Scalar::Util qw(looks_like_number);
@@ -24,7 +24,7 @@ sub _nap { select(undef, undef, undef, 0.05) }
 
 my %POOL;          # per-pool worker count
 my %SHIM;          # per-package auto-shim setting
-my %CLIM  :shared; # per-sub concurrency limit Thread::Subs::sem
+my %CLIM  :shared; # per-sub concurrency limit (shared scalar ref)
 my %DEFER :shared; # per-sub array for concurrency limits
 my %QLIM  :shared; # per-sub queue limit Thread::Subs::lim
 my %REQ   :shared; # per-pool request arrays
@@ -107,8 +107,8 @@ sub _define_one {
             if /^[cq]lim$/ && $val && $val =~ /\D/;
         $attr->$_($val);
     }
-    if ($attr->clim) {
-        $CLIM{$sub} = Thread::Subs::sem->new($attr->clim);
+    if (my $clim = $attr->clim) {
+        $CLIM{$sub} = shared_clone(\$clim);
         $DEFER{$sub} = shared_clone([]);
     }
     else {
@@ -233,8 +233,9 @@ sub _be_worker {
             $sub  = $work->[0];
             $clim = $CLIM{$sub};
             if ($clim) {
-                lock($clim); # exclusive on $clim and $DEFER{$sub}
-                unless ($clim->down_nb) {
+                lock($$clim); # exclusive on $clim and $DEFER{$sub}
+                if ($$clim > 0) { --$$clim }
+                else {
                     #@! Request for $sub deferred due to concurrency limit
                     push @{$DEFER{$sub}}, $work;
                     undef $work;
@@ -259,9 +260,9 @@ sub _be_worker {
             else             { $result->send(@res) }
             #@! Worker $tid executed $sub
             if ($clim) {
-                lock($clim); # exclusive on $clim and $DEFER{$sub}
+                lock($$clim); # exclusive on $clim and $DEFER{$sub}
                 $work = shift @{$DEFER{$sub}};
-                $clim->up unless $work;
+                ++$$clim unless $work;
             }
         }
         #@! Worker $tid finished handling $sub
@@ -458,29 +459,6 @@ sub qlim { @_ == 1 ? $_[0][2] || 0        : do { $_[0][2] = $_[1]; $_[0] } }
 sub shim { @_ == 1 ? !!$_[0][3]           : do { $_[0][3] = $_[1]; $_[0] } }
 
 
-package Thread::Subs::sem;
-
-use threads::shared;
-
-# Minimalist reimplementation of Thread::Semaphore.  No locking; the
-# only user is _be_worker, which does its own lock management.
-
-sub new {
-    my ($class, $sem) = @_;
-    return bless shared_clone(\$sem);
-}
-
-sub down_nb {
-    my ($sem) = @_;
-    return $$sem > 0 ? do { --$$sem; 1 } : 0;
-}
-
-sub up {
-    my ($sem) = @_;
-    ++$$sem;
-}
-
-
 package Thread::Subs::lim;
 
 use threads::shared;
@@ -530,17 +508,18 @@ use Scalar::Util qw(refaddr);
 # shared objects.
 
 my %CB;
-my @CBQ :shared; # call-back queue (ready)
-my $CBF :shared; # call-back flag (do not signal when true)
+my @CBQ :shared;     # call-back queue (ready)
+my $CBF :shared = 0; # call-back flag (do not signal when true)
 
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
 END {
     #@! Thread::Subs::result END: Cancel callbacks (@{[scalar keys %CB]})
+    $CBF = -1;
     %CB = ();
 }
 
-sub new { bless shared_clone([0]) }
+sub new { bless shared_clone([0, 0]) }
 
 sub _id { $MAIN ? is_shared($_[0]) // _die("BUG: result object not shared") : refaddr($_[0]) }
 
@@ -557,6 +536,7 @@ sub _callback {
 }
 
 sub run_callback_queue {
+    return if $CBF < 0; # at END
     _die("Callbacks must be executed in the main thread")
         if $MAIN and $THREADS->tid;
     #@! Invoking callbacks
@@ -578,18 +558,18 @@ sub cb {
         if $MAIN and $THREADS->tid;
     my ($self, $cb) = @_;
     my $id = $self->_id;
-    if (@_ > 1) {
-        delete $CB{$id};
-        $cb->($self) if do {
-            lock($self);
-            $self->[0] ? defined($cb) : do {
-                $CB{$id} = $cb if $cb;
-                $self->[1] = defined($cb);
-                0
-            };
-        };
-    }
-    return $CB{$id};
+    return $CB{$id} if @_ == 1;
+    my $sig = '';
+    do {
+        lock($self);
+        if ($cb) { $CB{$id} = $cb }
+        else     { delete $CB{$id} }
+        if ($self->[0] == 0) { $self->[1] = $cb ? 1 : 0 }
+        elsif ($cb) { lock(@CBQ); push @CBQ, $self; $sig = $SIG }
+    };
+    &Thread::Subs::_send_callback_signal
+        if $sig;
+    return $self;
 }
 
 sub ready  { $_[0][0] }
@@ -603,20 +583,11 @@ sub _set {
         lock($self);
         $cb = !$self->[0] && $self->[1];
         @$self = @$args;
-        # If this needs to go in the callback queue, do it now while
-        # we hold the lock.  Anything waiting on it can then run the
-        # queue immediately after unblocking to force the callback.
-        if ($cb and $MAIN and $THREADS->tid) { lock(@CBQ); push @CBQ, $self }
+        if ($cb) { lock(@CBQ); push @CBQ, $self }
         cond_broadcast($self);
     };
-    if ($cb) {
-        if ($MAIN and $THREADS->tid) {
-            # Wrong thread: maybe signal
-            &Thread::Subs::_send_callback_signal
-                if $SIG && !$CBF;
-        }
-        else { $self->_callback }
-    }
+    &Thread::Subs::_send_callback_signal
+        if $cb && $SIG && !$CBF;
     return $self;
 }
 
@@ -645,8 +616,7 @@ sub warn {
         warn "$msg: @{[$_[0]->data]}"
             if $_[0]->failed;
     };
-    $self->cb($cb);
-    return $self;
+    return $self->cb($cb);
 }
 
 sub fatal {
@@ -656,8 +626,7 @@ sub fatal {
         die "$msg: @{[$_[0]->data]}"
             if $_[0]->failed;
     };
-    $self->cb($cb);
-    return $self;
+    return $self->cb($cb);
 }
 
 sub ae_cv {
@@ -1258,34 +1227,41 @@ This has no equivalent in L<AnyEvent>.
 =head2 cb
 
     $code = $result->cb;
-    $code = $result->cb($code);
+    $result = $result->cb($code);
 
-Gets and optionally sets the callback for the $result.  This can only
-be done from the main thread because while it's possible in principle
-to have callbacks to any thread, it would be very complex to implement
-and use, so support is limited to the simplest case.
+Gets or sets the callback for the $result.  This can only be done from
+the main thread: it's possible in principle to have callbacks to any
+thread, but it would be very complex to implement and use, so support
+is limited to the simple case.
 
-You can only set one callback: it will be called immediately if the
-$result is already available, or from a signal handler when it becomes
-available.  This module reduces the use of signals by not sending them
-while the main thread is actively processing the callback queue, but
-one should still keep the contents of a callback to the same basics
-which are suitable in a signal handler.
+You can only set one callback: a second set operation replaces the old
+callback if it has not yet been called, and a false argument cancels
+the callback.  The callback is also removed on execution.  If the
+$result is ready when you set a callback, the callback may or may not
+have executed already when the method returns: make no assumptions.
+Unlike its L<AnyEvent> equivalent, the set mode returns self.
 
 There is no particular guarantee as to when a callback will run once
-the result is ready, but it is guaranteed that the callback is queued
-for execution or already executed by the time the result is ready.
-You can force execution using L</"run_callback_queue">.
+the result is ready, but the module considers the order of readiness
+to be important and preserves it.  The callback is enqueud when it is
+set if the result is ready, or when it becomes ready if set before
+then: whichever activity comes second adds the callback to the queue.
+What this means for your code is that calls to "clim=1" subs execute
+their callbacks in the same order so long as the callbacks are set in
+the same order.  In the general case, you don't have any guarantee of
+execution order: it's all a race.
+
+Callbacks are executed by the L</"run_callback_queue"> function, which
+is normally invoked by a signal handler, so callback code should be
+constrained to the same basics which are suitable in a signal handler.
+The $result is passed as the only argument, and any returned value is
+ignored.  Exceptions raised in callbacks will normally be fatal
+because the signal handler won't catch them.
 
 Once you've set a callback, you are not obliged to keep the $result
 object: it will be kept alive by the worker thread which is providing
 the result, and then by the callback itself.  If no further references
 to it are created, it will be destroyed when the callback completes.
-
-An explicit undef argument cancels the callback, and the callback is
-also removed on execution.  The callback is passed the $result as an
-argument with the promise that it is now ready, such that C<recv()>
-and C<data()> won't block.  Returned values are ignored.
 
 Note that all outstanding callbacks are cancelled when the process
 reaches the END state.  Avoid calling C<exit()> before callbacks are
@@ -1338,8 +1314,12 @@ a method if desired.  It is normally installed as the signal handler
 specified by the L</"signal"> function, but you'll need to make other
 arrangements if you've disabled it for some reason.  When called (from
 the main thread only), it executes callbacks on any ready results with
-an associated callback until the queue is empty.  Any result objects
-with callbacks which become ready during this call will be processed.
+an associated callback until the queue is empty, including any results
+which enter the queue while it is being processed.
+
+When the program reaches the END state, all still-pending callbacks
+are cancelled, and this function becomes a no-op.  Anything still in
+the queue awaiting execution at this point will be discarded.
 
 =head2 Async Adaptors
 
@@ -1436,6 +1416,20 @@ require that you call C<Thread::Subs::result::run_callback_queue()>
 via some other mechanism (like a timer) in this case.
 
 =head1 NOTES
+
+=head2 Version Compatibility
+
+This module requires Perl v5.12 or higher.  The attribute mechanism is
+incompatible with Perl v5.10 because the sub name is not available in
+that version when MODIFY_CODE_ATTRIBUTES is called.
+
+I encountered segfaults at exit during development while running the
+test suite on v5.14 and v5.16.  While I believe I have worked around
+the issue, I don't suggest using threads in general on those versions
+unless you can prove them stable in your environment.
+
+Starting with Perl v5.22, all the dependencies of this module are part
+of the core distribution.
 
 =head2 Use Cases
 
