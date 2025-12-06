@@ -112,9 +112,12 @@ $x = dies("scalar");
 &all_idle_ok;
 &do_callbacks;
 like($ERR, qr/void$/, "Void context exception produces exception");
-eval { $x->fatal };
-like($@, qr/scalar$/, "Fatal method produces exception");
+$ERR = '';
+$x->fatal;
+&do_callbacks;
+like($ERR, qr/scalar$/, "Fatal method produces exception");
 $x->warn;
+&do_callbacks;
 like($WARN, qr/scalar$/, "Warn method produces warning");
 
 eval { Thread::Subs::shim(\&nap) };
