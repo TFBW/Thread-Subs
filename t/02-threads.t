@@ -135,4 +135,5 @@ cmp_ok(time - $x, '>=', 0.02, "Waited for worker");
 eval { test(1) };
 ok($@, "Exception raised when shim called afer shutdown");
 
+is_deeply([Thread::Subs::running_workers()], [], "All workers stopped");
 done_testing();
