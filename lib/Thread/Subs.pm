@@ -218,38 +218,39 @@ sub signal {
 sub _be_worker {
     my ($pool) = @_;
     my $tid = $THREADS->tid;
-    my $set_sub = sub { lock(%TASK); $TASK{"$tid-$pool"} = $_[0]//'' };
+    my $set_sub = sub { lock(%TASK); $TASK{"$tid-$pool"} = $_[0]//''; return };
     #@! Worker $tid spawned for '$pool' pool
     my $queue = $REQ{$pool};
     my ($work, $result, $sub, @arg, $clim, $qlim);
-    while (1) {
-        do {
-            lock($queue);
-            cond_wait($queue) until @$queue or $STAGE == 4;
-            unless ($queue->[0]) {
-                cond_signal($queue);
-                last;
+    my $obtain_sub = sub {
+        lock(@$queue);
+        {   # redo from here
+            if (@$queue == 0) {
+                if ($STAGE < 4) { cond_wait(@$queue); redo }
+                else { cond_signal(@$queue); return 0 }
             }
-            # Take from the head of @$queue and check concurrency
-            # limits while holding the lock.  This ensures correct
-            # sequential execution order for clim=1 subs.
             $work = shift @$queue;
-            cond_signal($queue) if @$queue;
-            ($result, $sub, @arg) = @$work;
+            $sub  = $work->[0];
             $clim = $CLIM{$sub};
             if ($clim) {
                 lock($clim); # exclusive on $clim and $DEFER{$sub}
                 unless ($clim->down_nb) {
                     #@! Request for $sub deferred due to concurrency limit
                     push @{$DEFER{$sub}}, $work;
-                    next;
+                    undef $work;
+                    redo;
                 }
             }
-            #@! Worker $tid started $sub
+            #@! Worker $tid assigned to $sub
             $set_sub->($sub);
-        };
+            cond_signal(@$queue) if @$queue > 0;
+            return 1;
+        }
+    };
+    while (&$obtain_sub) {
         $qlim = $QLIM{$sub};
         while ($work) {
+            (undef, $result, @arg) = @$work;
             undef $work;
             $qlim->out if $qlim;
             no strict 'refs';
@@ -260,11 +261,10 @@ sub _be_worker {
             if ($clim) {
                 lock($clim); # exclusive on $clim and $DEFER{$sub}
                 $work = shift @{$DEFER{$sub}};
-                if ($work) { ($result, undef, @arg) = @$work }
-                else       { $clim->up }
+                $clim->up unless $work;
             }
         }
-        #@! Worker $tid finished $sub
+        #@! Worker $tid finished handling $sub
         $set_sub->();
     }
     #@! Worker $tid exits
@@ -327,9 +327,9 @@ sub shim {
         $qlim->in if $qlim; # can block
         $res->fatal("Exception in sub '$sub'")
             unless defined(wantarray) or $THREADS->tid;
-        lock($queue);
-        push @$queue, shared_clone([$res, $sub, @_]);
-        cond_signal($queue);
+        lock(@$queue);
+        push @$queue, shared_clone([$sub, $res, @_]);
+        cond_signal(@$queue);
         return $res;
     };
 }
