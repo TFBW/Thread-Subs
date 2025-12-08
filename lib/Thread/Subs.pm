@@ -512,6 +512,7 @@ my @CBQ :shared;     # call-back queue (ready)
 my $CBF :shared = 0; # call-back flag (do not signal when true)
 
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
+sub with_CBQ_locked (&) { lock(@CBQ); my $x = $_[0]->(); return $x }
 
 END {
     #@! Thread::Subs::result END: Cancel callbacks (@{[scalar keys %CB]})
@@ -536,21 +537,21 @@ sub _callback {
 }
 
 sub run_callback_queue {
-    return if $CBF < 0; # at END
+    return 0 if $CBF < 0; # at END
     _die("Callbacks must be executed in the main thread")
         if $MAIN and $THREADS->tid;
     #@! Invoking callbacks
     my $n = 0;
-    my $cb;
     $CBF = 1; # Suppress signals
     while ($CBF) {
-        if ($cb = do { lock(@CBQ); @CBQ > 0 ? shift @CBQ : ($CBF = 0) }) {
-            $n++;
-            $cb->_callback;
-        }
+        my $res = with_CBQ_locked {
+            if (@CBQ > 0) { return shift @CBQ }
+            else          { $CBF = 0; return  }
+        };
+        if ($res) { $n++; $res->_callback }
     }
     #@! Callback processing complete ($n)
-    return;
+    return $n;
 }
 
 sub cb {
@@ -560,13 +561,13 @@ sub cb {
     my $id = $self->_id;
     return $CB{$id} if @_ == 1;
     my $sig = '';
-    do {
+    {
         lock($self);
         if ($cb) { $CB{$id} = $cb }
         else     { delete $CB{$id} }
         if ($self->[0] == 0) { $self->[1] = $cb ? 1 : 0 }
-        elsif ($cb) { lock(@CBQ); push @CBQ, $self; $sig = $SIG }
-    };
+        elsif ($cb) { with_CBQ_locked { push @CBQ, $self; $sig = $SIG } }
+    }
     &Thread::Subs::_send_callback_signal
         if $sig;
     return $self;
@@ -579,13 +580,13 @@ sub _set {
     my $self = shift;
     my $args = shared_clone([@_]);
     my $cb;
-    do {
+    {
         lock($self);
         $cb = !$self->[0] && $self->[1];
         @$self = @$args;
-        if ($cb) { lock(@CBQ); push @CBQ, $self }
+        with_CBQ_locked { push @CBQ, $self } if $cb;
         cond_broadcast($self);
-    };
+    }
     &Thread::Subs::_send_callback_signal
         if $cb && $SIG && !$CBF;
     return $self;
@@ -1315,7 +1316,8 @@ specified by the L</"signal"> function, but you'll need to make other
 arrangements if you've disabled it for some reason.  When called (from
 the main thread only), it executes callbacks on any ready results with
 an associated callback until the queue is empty, including any results
-which enter the queue while it is being processed.
+which enter the queue while it is being processed.  Returns the number
+of callbacks executed.
 
 When the program reaches the END state, all still-pending callbacks
 are cancelled, and this function becomes a no-op.  Anything still in
