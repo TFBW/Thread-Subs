@@ -135,11 +135,13 @@ is($a, 0, "Still pending");
 $r->send('x');
 ok($r->ready, "Ready now");
 ok(!$r->failed, "Not failed");
+is(Thread::Subs::result::run_callback_queue(), 1, "One queued callback ran");
 is($a, 1, "Callback executed");
 ok(!$r->cb, "Callback cleared");
 is($r->recv, 'x', "Data received");
 $r->cb(sub { $a = 2 });
-is($a, 2, "New callback is immediate");
+is(Thread::Subs::result::run_callback_queue(), 1, "One queued callback ran");
+is($a, 2, "New callback executed");
 ok(!$r->cb, "Callback cleared");
 
 &new_r;

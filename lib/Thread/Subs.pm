@@ -8,7 +8,7 @@ my $THREADS = threads::posix->can('create') ? 'threads::posix' : 'threads';
 my $MAIN    = $THREADS->can('self') && $THREADS->self;
 
 package Thread::Subs;
-our $VERSION = '0.400';
+our $VERSION = '0.500';
 
 use threads::shared;
 use Scalar::Util qw(looks_like_number);
@@ -217,36 +217,35 @@ sub signal {
 
 sub _be_worker {
     my ($pool) = @_;
-    my $tid = $THREADS->tid;
-    my $set_sub = sub { lock(%TASK); $TASK{"$tid-$pool"} = $_[0]//''; return };
-    #@! Worker $tid spawned for '$pool' pool
+    my $id = join('-', $THREADS->tid, $pool);
+    #@! Worker $id spawned
     my $queue = $REQ{$pool};
     my ($work, $result, $sub, @arg, $clim, $qlim);
     my $obtain_sub = sub {
         lock(@$queue);
-        {   # redo from here
-            if (@$queue == 0) {
+        {   # redo point
+            unless (@$queue) {
                 if ($STAGE < 4) { cond_wait(@$queue); redo }
-                else { cond_signal(@$queue); return 0 }
+                else            { cond_signal(@$queue); return 0 }
             }
             $work = shift @$queue;
             $sub  = $work->[0];
             $clim = $CLIM{$sub};
             if ($clim) {
                 lock($$clim); # exclusive on $clim and $DEFER{$sub}
-                if ($$clim > 0) { --$$clim }
-                else {
+                unless ($$clim > 0) {
                     #@! Request for $sub deferred due to concurrency limit
                     push @{$DEFER{$sub}}, $work;
                     undef $work;
                     redo;
                 }
+                --$$clim;
             }
-            #@! Worker $tid assigned to $sub
-            $set_sub->($sub);
-            cond_signal(@$queue) if @$queue > 0;
-            return 1;
         }
+        #@! Worker $id assigned to $sub
+        do { lock(%TASK); $TASK{$id} = $sub };
+        cond_signal(@$queue) if @$queue;
+        return 1;
     };
     while (&$obtain_sub) {
         $qlim = $QLIM{$sub};
@@ -254,21 +253,20 @@ sub _be_worker {
             (undef, $result, @arg) = @$work;
             undef $work;
             $qlim->out if $qlim;
-            no strict 'refs';
-            my @res = eval { $sub->(@arg) };
+            my @res = eval { no strict 'refs'; $sub->(@arg) };
             if (my $ex = $@) { $result->croak($ex) }
             else             { $result->send(@res) }
-            #@! Worker $tid executed $sub
+            #@! Worker $id executed $sub
             if ($clim) {
                 lock($$clim); # exclusive on $clim and $DEFER{$sub}
                 $work = shift @{$DEFER{$sub}};
                 ++$$clim unless $work;
             }
         }
-        #@! Worker $tid finished handling $sub
-        $set_sub->();
+        #@! Worker $id finished handling $sub
+        do { lock(%TASK); $TASK{$id} = '' };
     }
-    #@! Worker $tid exits
+    #@! Worker $id exits
     return;
 }
 
@@ -508,15 +506,14 @@ use Scalar::Util qw(refaddr);
 # shared objects.
 
 my %CB;
-my @CBQ :shared;     # call-back queue (ready)
-my $CBF :shared = 0; # call-back flag (do not signal when true)
+my @CBQ :shared;     # callback queue (ready result objects)
+my $CBF :shared = 0; # callbacks running flag (do not signal when true)
 
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
-sub with_CBQ_locked (&) { lock(@CBQ); my $x = $_[0]->(); return $x }
 
 END {
-    #@! Thread::Subs::result END: Cancel callbacks (@{[scalar keys %CB]})
     $CBF = -1;
+    #@! Thread::Subs::result END: Cancel callbacks (@{[scalar keys %CB]})
     %CB = ();
 }
 
@@ -536,19 +533,26 @@ sub _callback {
     return;
 }
 
+# NB: this can be executed directly or by a signal handler, so it can
+# interrupt itself!  $CBF handles self-exclusion.
 sub run_callback_queue {
-    return 0 if $CBF < 0; # at END
+    return 0 if $CBF; # at END or already executing
     _die("Callbacks must be executed in the main thread")
         if $MAIN and $THREADS->tid;
+    $CBF = 1; # exclude self and inhibit signals
     #@! Invoking callbacks
     my $n = 0;
-    $CBF = 1; # Suppress signals
     while ($CBF) {
-        my $res = with_CBQ_locked {
-            if (@CBQ > 0) { return shift @CBQ }
-            else          { $CBF = 0; return  }
+        my $result = do {
+            lock(@CBQ);
+            if (@CBQ) { shift @CBQ }
+            else      { $CBF = 0   }
         };
-        if ($res) { $n++; $res->_callback }
+        if ($result) {
+            $n++;
+            eval { $result->_callback; 1 }
+            or do { $CBF = 0; die $@ };
+        }
     }
     #@! Callback processing complete ($n)
     return $n;
@@ -561,13 +565,13 @@ sub cb {
     my $id = $self->_id;
     return $CB{$id} if @_ == 1;
     my $sig = '';
-    {
+    do {
         lock($self);
-        if ($cb) { $CB{$id} = $cb }
+        if ($cb) { $CB{$id} = $cb  }
         else     { delete $CB{$id} }
-        if ($self->[0] == 0) { $self->[1] = $cb ? 1 : 0 }
-        elsif ($cb) { with_CBQ_locked { push @CBQ, $self; $sig = $SIG } }
-    }
+        if    ($self->[0] == 0) { $self->[1] = $cb ? 1 : 0 }
+        elsif ($cb)             { lock(@CBQ); push @CBQ, $self; $sig = $SIG }
+    };
     &Thread::Subs::_send_callback_signal
         if $sig;
     return $self;
@@ -580,13 +584,13 @@ sub _set {
     my $self = shift;
     my $args = shared_clone([@_]);
     my $cb;
-    {
+    do {
         lock($self);
-        $cb = !$self->[0] && $self->[1];
+        $cb = $self->[0] == 0 && $self->[1];
         @$self = @$args;
-        with_CBQ_locked { push @CBQ, $self } if $cb;
+        if ($cb) { lock(@CBQ); push @CBQ, $self }
         cond_broadcast($self);
-    }
+    };
     &Thread::Subs::_send_callback_signal
         if $cb && $SIG && !$CBF;
     return $self;
@@ -1319,6 +1323,14 @@ an associated callback until the queue is empty, including any results
 which enter the queue while it is being processed.  Returns the number
 of callbacks executed.
 
+If a callback dies, the exception will be passed through.  This will
+normally occur in the signal handler context and result in the process
+exiting.  If you install a wrapper which catches the exceptions, you
+should bear in mind that the callback queue may not be empty after
+such an exception: the offending callback will no longer be in the
+queue, but others may still be waiting, so call it again if you intend
+to carry on.
+
 When the program reaches the END state, all still-pending callbacks
 are cancelled, and this function becomes a no-op.  Anything still in
 the queue awaiting execution at this point will be discarded.
@@ -1427,8 +1439,8 @@ that version when MODIFY_CODE_ATTRIBUTES is called.
 
 I encountered segfaults at exit during development while running the
 test suite on v5.14 and v5.16.  While I believe I have worked around
-the issue, I don't suggest using threads in general on those versions
-unless you can prove them stable in your environment.
+the issue with high probability, the segfaults are still possible, so
+I recommend against using these versions.
 
 Starting with Perl v5.22, all the dependencies of this module are part
 of the core distribution.

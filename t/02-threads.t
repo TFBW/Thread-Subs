@@ -49,12 +49,11 @@ sub all_idle_ok {
 is(scalar(Thread::Subs::startup(10)), 2, "Started two pools");
 
 my $ERR = '';
-my $do_callbacks = do {
+$SIG{CONT} = do {
     my $sig = $SIG{CONT};
     sub { eval { &$sig }; $ERR .= $@ if $@ }
 };
-$SIG{CONT} = $do_callbacks;
-sub do_callbacks { $do_callbacks->('CONT') }
+sub do_callbacks { $SIG{CONT}->('CONT') }
 my $WARN = '';
 $SIG{__WARN__} = sub { $WARN .= "@_" };
 
