@@ -20,7 +20,7 @@ our @CARP_NOT = qw(attributes);
 # If a _die message starts with "BUG", it's meant to be unreachable.
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 sub _bad { _die("Invalid Thread attribute: @_") }
-sub _nap { select(undef, undef, undef, 0.05) }
+sub _nap { select(undef, undef, undef, 0.05) } # microsleep
 
 my %POOL;          # per-pool worker count
 my %SHIM;          # per-package auto-shim setting
@@ -186,7 +186,7 @@ sub end_definitions {
 }
 
 sub set_pool {
-    &end_definitions if $STAGE == 0;
+    end_definitions() if $STAGE == 0;
     _die("Thread::Subs::set_pool() called when workers already started")
         if $STAGE > 1;
     unshift @_, $DEFAULT
@@ -200,7 +200,7 @@ sub set_pool {
             if $count =~ /\D/ or $count < 1;
         $POOL{$pool} = $count;
     }
-    return &end_definitions;
+    return end_definitions();
 }
 
 sub signal {
@@ -273,7 +273,7 @@ sub _be_worker {
 sub start_workers {
     _die("Can't start workers: threads not available")
         unless defined $MAIN;
-    &end_definitions if $STAGE == 0;
+    end_definitions() if $STAGE == 0;
     _die("Workers already started")
         if $STAGE > 1;
     $STAGE = 2;
@@ -305,7 +305,7 @@ sub start_workers {
     #@! @{[$SIG ? "Using $SIG signal" : "No handler"]} for callbacks
     $SIG{$SIG} = \&Thread::Subs::result::run_callback_queue
         if $SIG;
-    return &end_definitions;
+    return end_definitions();
 }
 
 sub shim {
@@ -352,9 +352,9 @@ sub startup {
     _die("Workers already started")
         if $STAGE > 1;
     &set_pool if @_;
-    my %pool = &start_workers;
-    &deploy_shims;
-    return &end_definitions;
+    start_workers();
+    deploy_shims();
+    return end_definitions();
 }
 
 sub endwait {
@@ -397,15 +397,15 @@ sub running_workers {
 sub stop_and_wait {
     _die("Attempt to stop_and_wait in a thread")
         if $MAIN and $THREADS->tid;
-    &stop_workers;
+    stop_workers();
     #@! Waiting for workers
-    &_nap while &running_workers;
+    _nap() while running_workers();
     #@! All worker threads joined
-    &Thread::Subs::result::run_callback_queue;
+    Thread::Subs::result::run_callback_queue();
     return;
 }
 
-sub current_tasks { lock(%TASK); &running_workers; return %TASK }
+sub current_tasks { lock(%TASK); running_workers(); return %TASK }
 
 sub queue_slack {
     local $Caller = caller;
@@ -424,12 +424,12 @@ sub is_idle {
     _die("No such worker pool '$_'")
         for grep { !$REQ{$_} } @_;
     my @pool = @_ ? @_ : keys(%REQ);
-    lock($_) for map { $REQ{$_} } @pool;
+    lock(@$_) for map { $REQ{$_} } @pool;
     return 0 if grep { @{$REQ{$_}} > 0 } @pool;
     my $pools = join('|', map { quotemeta($_) } @pool);
     lock(%TASK);
     return 0
-        for grep { $TASK{$_} and /-($pools)$/ } keys %TASK;
+        for grep { $TASK{$_} and /-(?:$pools)$/ } keys %TASK;
     return 1;
 }
 
@@ -438,7 +438,7 @@ END {
     &stop_workers;
     my $lim = time + $ENDWAIT;
     while (&running_workers) {
-        if (time < $lim) { &_nap }
+        if (time < $lim) { _nap() }
         else {
             #@! Detaching remaining workers
             $_->detach for &running_workers;
@@ -512,7 +512,7 @@ my $CBF :shared = 0; # callbacks running flag (do not signal when true)
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
 END {
-    $CBF = -1;
+    $CBF = -1; # disable run_callback_queue and inhibit signals
     #@! Thread::Subs::result END: Cancel callbacks (@{[scalar keys %CB]})
     %CB = ();
 }
@@ -564,6 +564,7 @@ sub cb {
     my ($self, $cb) = @_;
     my $id = $self->_id;
     return $CB{$id} if @_ == 1;
+    return $self if $CBF == -1; # no-op if END reached
     my $sig = '';
     do {
         lock($self);
@@ -588,7 +589,7 @@ sub _set {
         lock($self);
         $cb = $self->[0] == 0 && $self->[1];
         @$self = @$args;
-        if ($cb) { lock(@CBQ); push @CBQ, $self }
+        if ($cb && $CBF != -1) { lock(@CBQ); push @CBQ, $self }
         cond_broadcast($self);
     };
     &Thread::Subs::_send_callback_signal
@@ -1120,13 +1121,16 @@ This function is only available in the main thread.
 When the process exits, some worker threads may still be running,
 either because the work takes a while or because there are still
 requests in the queue.  This value gives the number of seconds to wait
-in the END state before giving up and detaching them.  The workers
+in the END phase before giving up and detaching them.  The workers
 will stop naturally if they complete all remaining work before this
-time limit.  You may want to set this to a nonzero value if your
-threads are potentially doing something you'd rather not interrupt,
-but the trade-off is that process exit may be delayed.  Bear in mind
-that this delay applies both to explicit C<exit()> and abnormal exits
-via C<die()>, but not uncaught signals.
+time limit.
+
+Setting this to a small non-zero value can help to prevent spurious
+warnings about still-running threads at exit.  You may want to set
+this to a larger value if your threads are potentially doing something
+you'd rather not interrupt, but the trade-off is that process exit may
+be delayed.  Bear in mind that this delay applies both to explicit
+C<exit()> and abnormal exits via C<die()>, but not uncaught signals.
 
 =head2 stop_workers
 
@@ -1191,6 +1195,9 @@ semantics of $sub are as per L</"shim">.
 
 Where no $sub is specified, returns a list of name-value pairs for all
 subs with a queue limit and their current slack.
+
+Bear in mind that these are volatile numbers, and reality can easily
+have changed by the time you see them.
 
 =head2 is_idle
 
@@ -1269,8 +1276,8 @@ the result, and then by the callback itself.  If no further references
 to it are created, it will be destroyed when the callback completes.
 
 Note that all outstanding callbacks are cancelled when the process
-reaches the END state.  Avoid calling C<exit()> before callbacks are
-complete if that's undesirable.
+reaches the END phase, and any attempt to set a new one is ignored.
+Avoid C<exit()> before callbacks are complete if that's undesirable.
 
 =head2 fatal
 
@@ -1331,9 +1338,9 @@ such an exception: the offending callback will no longer be in the
 queue, but others may still be waiting, so call it again if you intend
 to carry on.
 
-When the program reaches the END state, all still-pending callbacks
+When the program reaches the END phase, all still-pending callbacks
 are cancelled, and this function becomes a no-op.  Anything still in
-the queue awaiting execution at this point will be discarded.
+the queue awaiting execution at this point is lost.
 
 =head2 Async Adaptors
 
@@ -1550,8 +1557,8 @@ almost as good.
 =head2 Limitations and Workarounds
 
 Thread subs can't receive or return the more esoteric data types such
-as globs or code refs.  The glob limitation affects filehandles, so
-you'll need to make special arrangements to deal with them.
+as globs, code refs, or C<qr//> regexes.  The glob limitation affects
+filehandles, so you'll need to make special arrangements for files.
 
 The simplest approach is to pass filenames instead of handles, though
 this may result in excessive opening and closing if done naively.  A
