@@ -34,7 +34,7 @@ my %TASK  :shared; # per-thread current sub
 my $ENDWAIT = 0;
 my $STAGE :shared = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
 
-our $Caller; # For _name() qualification
+our $Caller; # for _name() qualification
 
 # See start_workers for possible redefinition.
 sub _send_callback_signal {
@@ -573,7 +573,7 @@ sub cb {
         if    ($self->[0] == 0) { $self->[1] = $cb ? 1 : 0 }
         elsif ($cb)             { lock(@CBQ); push @CBQ, $self; $sig = $SIG }
     };
-    &Thread::Subs::_send_callback_signal
+    Thread::Subs::_send_callback_signal()
         if $sig;
     return $self;
 }
@@ -592,7 +592,7 @@ sub _set {
         if ($cb && $CBF != -1) { lock(@CBQ); push @CBQ, $self }
         cond_broadcast($self);
     };
-    &Thread::Subs::_send_callback_signal
+    Thread::Subs::_send_callback_signal()
         if $cb && $SIG && !$CBF;
     return $self;
 }
@@ -702,17 +702,20 @@ parallelism is concerned, but this module manages the creation and
 termination of worker threads, provides attributes whereby a sub can
 be marked as threaded, allows limits to be placed on concurrency and
 outstanding requests, and provides an asynchronous results interface.
-The net effect is that you can simply declare a sub as "Thread" and
-then call it asynchronously, so long as the data in and out can be
-shared using L<threads::shared>.
 
-The major difference between this module and other similar ones is
-that this one aims for very low cognitive overhead for the programmer:
-one should barely even be aware that other threads are running most of
-the time.  The ideal is that one simply declares a sub to be threaded;
-in practice you also need to change the sub interface to accommodate
-the fact that it becomes non-blocking, but this is handled using an
-API which will be familiar to anyone who has used an event loop.
+The net effect is that you can mark a sub with the "Thread" attribute
+then call it as usual: it immediately returns a lightweight result
+object (very similar to an L<AnyEvent> condition variable) while the
+actual work proceeds in a worker thread.  Data passed to and returned
+from the sub must be sharable via L<threads::shared>.
+
+Unlike most thread-pool or fork-manager modules, Thread::Subs aims to
+provide a high-level abstraction that minimises cognitive overhead.
+After the one-time pool startup, the presence of worker threads is
+almost invisible in application code.  The ideal is that one simply
+declares a sub to be threaded; in practice you also need to change the
+sub interface to accommodate the fact that it becomes non-blocking,
+but this will be familiar to anyone who has used an event loop.
 
 Note that this documentation is not a tutorial on threading or even on
 Perl threads in particular.  It aims to be as accessable as possible,
@@ -748,9 +751,10 @@ parameters and others are described in more detail later.
 The threads which execute the subs are "workers", potentially divided
 into named "pools" associated with particular subs.  In the simplest
 case, all workers are part of the "DEFAULT" pool.  Workers are spawned
-early in the process lifecycle and persist until shut down.  You can
-decide how many workers and pools you want.  Dynamic pool adjustment
-is not available: static pools are used for simplicity and efficiency.
+early in the process lifecycle and persist until shut down, minimising
+the associated overhead.  This design trades off some flexibility for
+simplicity and efficiency: you can configure the number of workers per
+pool at startup, but not dynamically afterwards.
 
 Each worker pool is associated with a queue (a shared array) into
 which requests are inserted; workers take from the head of this queue
@@ -768,12 +772,11 @@ very similar to an L<AnyEvent> condition variable.  This object also
 provides methods to convert the result into other popular async result
 methods such as L<Future> and L<Mojo::Promise>.
 
-The final value can be obtained from a "result" object in two ways:
-blocking wait, or callback.  In the case of a blocking wait, the
-C<recv()> operation blocks using L<threads::shared> cond_wait() until
-the worker signals completion.  In the callback case, a callback is
-associated with a request: it is called immediately if the result is
-already available, or from a signal handler when it becomes available.
+You can obtain the final value from a "result" object in two ways:
+block with C<< ->recv >>, or set a callback function.  The blocking
+mode uses L<threads::shared> C<cond_wait()> to wait for the worker to
+signal completion.  In the callback case, the function is invoked from
+a signal handler in the main thread when the result is ready.
 
 Note that the "result" object is capable of conveying either a list of
 returned data or an exception condition.  The execution context for a
@@ -797,11 +800,11 @@ to hide such a fundamental change.  Aside from the "result" object, as
 discussed in the previous section, however, the change is surprisingly
 transparent.  Once the properties of all threaded subs are declared
 and the worker threads start up, the original subs can be replaced (in
-the main thread only) with shims; this allows them to be called in the
-same way as normal subs, modulo the fact that they return a "result"
-object immediately instead of blocking until they return data.  The
-code inside a threaded sub need not do anything special at all: data
-in and out is handled in the usual way.
+the main thread only) with shims by installing them directly into the
+original subroutines' symbol table slots.  This means they are called
+as normal, modulo the fact that they immediately return a "result"
+object instead of blocking.  The code inside a threaded sub need not
+do anything special at all: data in and out is handled as usual.
 
 Replacing the original subs with shims is not always the best option,
 but the shim itself is simply a CODE reference (a closure) which can
@@ -1673,6 +1676,8 @@ pattern is likely to add complexity to the shutdown process.
 
 =head1 SEE ALSO
 
+=head2 Enhancements
+
 L<threads::posix> enhances L<threads> to use real per-thread signals
 via the POSIX pthreads library, and this module will use it if already
 loaded.  Recommended if you're using a POSIX platform other than Linux
@@ -1684,14 +1689,29 @@ L<Mojo::Promise>), and L<Future> async interfaces.  It doesn't depend
 on any of them, however: the associated functionality is available if
 the module is already loaded.
 
-L<Thread::Pool> is a mature alternative to this module which requires
-much more active management of the workers and offers no syntactic
-sugar, but it is more appropriate if you need dynamic worker pools.
-
 This module contains comments suitable for L<Debug::Comments>.  If you
 want debug output which shows dispatching and callback activity, you
 can produce it if L<Debug::Comments> is available and the environment
 variable "DEBUG_THREAD_SUBS" is set to a true value.
+
+Exception messages are produced by L<Carp> C<croak()> if it is already
+loaded, or by plain old C<die()> with no line numbers if not.  Error
+messages may be more informative if you use L<Carp>.
+
+=head2 Alternatives
+
+L<Thread::Pool> is a mature alternative to this module which requires
+much more active management of the workers and offers no syntactic
+sugar, but it is more appropriate if you need dynamic worker pools.
+
+L<Parallel::ForkManager> provides process-based parallelism, which
+avoids the limitations of shared memory but incurs higher overhead per
+task.  Suitable for coarse-grained work with fully independent tasks.
+
+L<MCE> (Many-Core Engine) is a comprehensive parallel processing
+ecosystem offering both thread and process-based parallelism with many
+options for data flow and coordination.  It is considerably more
+powerful and correspondingly more complex than this module.
 
 =head1 LICENSE AND COPYRIGHT
 
