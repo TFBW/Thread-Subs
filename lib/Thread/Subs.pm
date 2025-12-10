@@ -8,7 +8,7 @@ my $THREADS = threads::posix->can('create') ? 'threads::posix' : 'threads';
 my $MAIN    = $THREADS->can('self') && $THREADS->self;
 
 package Thread::Subs;
-our $VERSION = '0.500';
+our $VERSION = '1.000';
 
 use threads::shared;
 use Scalar::Util qw(looks_like_number);
@@ -1554,8 +1554,8 @@ an alias, like C<*foo = \&bar;>, the "name" will be the name of the
 original sub, which may or may not work.  Using a plain string is the
 safer approach.  The usual argument against it is that there is no
 compile-time checking of the name, but run-time checking is performed
-by C<define()> fairly early in the process lifecycle, and that's
-almost as good.
+by C<define()> fairly early in the process lifecycle, and that's just
+as good if the name is stored in a constant or similar.
 
 =head2 Limitations and Workarounds
 
