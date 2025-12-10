@@ -72,6 +72,55 @@ parallel execution at will.
 - Workers can't use callbacks (main thread only)
 - Significant per-call overhead compared to normal function calls
 
+### Example
+
+The following program is a CPU-intensive search for partial MD5 hash
+matches.  It finds and prints ten distinct strings which have a hex
+MD5 hash starting with five zeros.  There is no parallelism.
+
+```perl
+use 5.012;
+use warnings;
+use Digest::MD5 qw(md5_hex);
+
+sub find_partial_md5 {
+    my ($string, $target) = @_;
+    my $x = 0;
+    ++$x until substr(md5_hex("$string $x"), 0, length($target)) eq $target;
+    return "$string $x";
+}
+
+say $_ for map { find_partial_md5("blah $_", '00000') } (1..10);
+```
+
+This is an easily parallelised problem: if we have the resources, we
+can execute all ten calls in parallel.  Let's assume we have resources
+to run five simultaneously.  The parallelised code is as follows, with
+attention drawn to the changes.
+
+```perl
+use 5.012;
+use warnings;
+use threads;                   # added
+use Digest::MD5 qw(md5_hex);
+use Thread::Subs;              # added
+
+sub find_partial_md5 :Thread { # added attribute
+    my ($string, $target) = @_;
+    my $x = 0;
+    ++$x until substr(md5_hex("$string $x"), 0, length($target)) eq $target;
+    return "$string $x";
+}
+
+Thread::Subs::startup(5); # start 5 workers
+# Same map, but we store it in an array, then process the results.
+my @work = map { find_partial_md5("blah $_", '00000') } (1..10);
+say $_->recv for @work;
+```
+
+This produces the same output, but will execute in considerably less
+time if you have available CPU resources.
+
 ## Installation
 
 ```bash
@@ -124,6 +173,7 @@ $result->cb(sub {
     if ($r->failed) { warn "Failed: ", $r->data }
     else { process_data($r->data) }
 });
+Thread::Subs::stop_and_wait(); # ensure callbacks happen before exit
 ```
 
 ### Concurrency Control
@@ -182,7 +232,7 @@ sub crunch_numbers :Thread {
     # Expensive calculation
 }
 
-Thread::Subs::startup(7);  # Leave one core free
+Thread::Subs::startup(7);  # Leave one core free (assumes 8)
 
 my @jobs = map { crunch_numbers($_) } @data;
 my @results = map { $_->recv } @jobs;
@@ -193,7 +243,7 @@ my @results = map { $_->recv } @jobs;
 Manage limited resources (database connections, API clients):
 
 ```perl
-package DB::Worker;
+use DBI;
 use Thread::Subs;
 
 my $dbh;  # Each worker gets its own connection
@@ -226,10 +276,10 @@ append_file("Entry 2\n");
 
 ## Requirements
 
-- Perl 5.12 or later
+- Perl 5.12 or later with threads
 - Working `threads` implementation
 - Core modules: threads::shared, Scalar::Util, Time::HiRes
-- CPAN modules: Sub::Util (1.40+) if Perl <5.022
+- CPAN modules: Sub::Util (1.40+) (is core as of Perl v5.22)
 
 Optional:
 - `AnyEvent` for ->ae_cv support
