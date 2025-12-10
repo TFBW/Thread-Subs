@@ -22,7 +22,7 @@ is(scalar(Thread::Subs::startup(5)), 1, "One worker pool started");
 
 AE::postpone { $x = 'post' };
 is($x, undef, "Postponed op has not executed");
-test(1)->ae_cv->recv;
+test(5)->ae_cv->recv;
 is($x, 'post', "Postponed op ran while waiting");
 
 $x = '';
