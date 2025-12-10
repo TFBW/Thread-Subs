@@ -37,10 +37,11 @@ ok($f->is_failed, "Future is failed");
 
 $x = '';
 my @fut = map {
-    test($_)->future->on_done(sub { $x .= "+@_" });
+    test($_)->future->on_done(sub { $x .= "<@_>" });
 } (1,5,3,7,4);
 $fut[-1]->cancel;
 Thread::Subs::stop_and_wait();
-is($x, '+1+3+5+7', "Futures executed and canceled correctly");
+# Most likely result is '<1><3><5><7>', but order not guaranteed
+like($x, qr/^(?:<[1357]>){4}$/, "Futures executed and canceled correctly");
 
 done_testing();
