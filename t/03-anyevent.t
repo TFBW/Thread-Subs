@@ -20,6 +20,9 @@ sub dies :Thread { nap(5); die "@_\n" }
 my $x;
 is(scalar(Thread::Subs::startup(5)), 1, "One worker pool started");
 
+# Limit delay if AnyEvent::Loop hits its race condition.
+my $wakeup = AE::timer 1, 1, sub { };
+
 AE::postpone { $x = 'post' };
 is($x, undef, "Postponed op has not executed");
 test(5)->ae_cv->recv;
