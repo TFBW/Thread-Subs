@@ -36,34 +36,24 @@ my $STAGE :shared = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
 
 our $Caller; # for _name() qualification
 
-# See start_workers for possible redefinition.
-sub _send_callback_signal {
-    #@! Sending $SIG via threads->kill
-    $MAIN->kill($SIG);
-    return;
-}
+# start_workers redefines these with signal details
+sub _send_callback_signal { _die("Signal not settled yet") }
+sub mask_callback_signal  { _die("Signal not settled yet") }
 
-# Call this in a thread to avoid namespace pollution.
-sub _can_tgkill {
-    my @x = eval {
-        require "syscall.ph";
-        return ()
-            unless exists(&SYS_gettid)
-            and exists(&SYS_tgkill);
+# Call this in a thread to ditch Config.pm after use.
+sub _get_signum {
+    my $sig = eval {
         our %Config;
-        require "Config.pm";
-        import Config '%Config';
-        return () unless $Config{sig_name} and $Config{sig_num};
-        my @sig = split(' ', $Config{sig_name});
-        my @num = split(' ', $Config{sig_num});
-        for (0..$#sig) {
-            return (&SYS_gettid, &SYS_tgkill, $num[$_])
-                if $sig[$_] eq $SIG and defined($num[$_]);
-        }
-        return ();
-    };
-    #@! _can_tgkill: @{[$@ ? $@ : "(@x)"]}
-    return @x;
+        require Config;
+        die "no sig_name\n" unless $Config::Config{sig_name};
+        die "no sig_num\n"  unless $Config::Config{sig_num};
+        my @sig = split(' ', $Config::Config{sig_name});
+        my @num = split(' ', $Config::Config{sig_num});
+        for (0..$#sig) { return $num[$_] if $sig[$_] eq $SIG }
+        die "$SIG not found\n";
+    } // 0;
+    #@! _get_signum: @{[$@ ? $@ : "$SIG=$sig"]}
+    return $sig;
 }
 
 sub import {
@@ -219,6 +209,8 @@ sub _be_worker {
     my ($pool) = @_;
     my $id = join('-', $THREADS->tid, $pool);
     #@! Worker $id spawned
+    mask_callback_signal();
+    do { lock(%TASK); $TASK{$id} = ''; cond_signal(%TASK) };
     my $queue = $REQ{$pool};
     my ($work, $result, $sub, @arg, $clim, $qlim);
     my $obtain_sub = sub {
@@ -272,25 +264,41 @@ sub _be_worker {
 
 sub start_workers {
     _die("Can't start workers: threads not available")
-        unless defined $MAIN;
+        unless $MAIN;
     end_definitions() if $STAGE == 0;
     _die("Workers already started")
         if $STAGE > 1;
     $STAGE = 2;
-    if ($SIG and $THREADS eq 'threads') {
-        #@! Lame thread signals detected; testing for tgkill() capability
-        my ($caps) = $THREADS->create(\&_can_tgkill);
-        if (my ($gettid, $tgkill, $signum) = map { $_ + 0 } $caps->join) {
-            #@! Support for tgkill() detected (syscall $tgkill)
-            $! = 0;
-            my $tid = syscall($gettid);
-            _die("gettid ($gettid) syscall failed: $!") if $!;
-            no warnings 'redefine';
-            *_send_callback_signal = sub {
-                #@! Sending signal $signum ($SIG) to $$/$tid via tgkill
-                syscall($tgkill, $$, $tid, $signum);
-            };
-        }
+    no warnings 'redefine';
+    if (!$SIG) {
+        #@! No signal or handler for callbacks
+        *_send_callback_signal = *mask_callback_signal = sub { };
+    }
+    elsif ($THREADS ne 'threads') {
+        #@! Using $THREADS->kill($SIG) for callbacks
+        *_send_callback_signal = sub {
+            #@! Sending $SIG via $THREADS->kill
+            $MAIN->kill($SIG);
+            return;
+        };
+        *mask_callback_signal = sub { }; # not needed
+    }
+    else {
+        my $signum = $THREADS->create(\&_get_signum)->join;
+        _die("Unable to determine signal number for '$SIG'")
+            unless $signum;
+        #@! Using kill $SIG ($signum) for callbacks
+        *_send_callback_signal = sub {
+            #@! Sending $SIG ($signum) to PID=$$
+            kill $signum, $$;
+            return;
+        };
+        require POSIX;
+        *mask_callback_signal = sub {
+            _die("Attempt to mask_callback_signal in the main thread")
+                unless $THREADS->tid;
+            return POSIX::sigprocmask(POSIX::SIG_BLOCK(), POSIX::SigSet->new($signum));
+        };
     }
     lock(%TASK);
     for my $pool (keys %POOL) {
@@ -299,10 +307,9 @@ sub start_workers {
         $REQ{$pool} = shared_clone([]);
         for (1..$count) {
             my $tid = $THREADS->create(\&_be_worker, $pool)->tid;
-            $TASK{"$tid-$pool"} = '';
+            cond_wait(%TASK) until exists($TASK{"$tid-$pool"});
         }
     }
-    #@! @{[$SIG ? "Using $SIG signal" : "No handler"]} for callbacks
     $SIG{$SIG} = \&Thread::Subs::result::run_callback_queue
         if $SIG;
     return end_definitions();
@@ -565,13 +572,18 @@ sub cb {
     my $id = $self->_id;
     return $CB{$id} if @_ == 1;
     return $self if $CBF == -1; # no-op if END reached
-    my $sig = '';
+    my $sig;
     do {
         lock($self);
         if ($cb) { $CB{$id} = $cb  }
         else     { delete $CB{$id} }
-        if    ($self->[0] == 0) { $self->[1] = $cb ? 1 : 0 }
-        elsif ($cb)             { lock(@CBQ); push @CBQ, $self; $sig = $SIG }
+        if ($self->[0] == 0) { $self->[1] = $cb ? 1 : 0 }
+        elsif ($cb) {
+            local $SIG{$SIG} = 'IGNORE' if $SIG; # inhibit queue processing
+            lock(@CBQ);
+            push @CBQ, $self;
+            $sig = $SIG;
+        }
     };
     Thread::Subs::_send_callback_signal()
         if $sig;
@@ -584,16 +596,22 @@ sub failed { $_[0][0] < 0 }
 sub _set {
     my $self = shift;
     my $args = shared_clone([@_]);
-    my $cb;
+    my $sig;
     do {
         lock($self);
-        $cb = $self->[0] == 0 && $self->[1];
+        my $cb = $self->[0] == 0 && $self->[1];
         @$self = @$args;
-        if ($cb && $CBF != -1) { lock(@CBQ); push @CBQ, $self }
+        if ($cb && $CBF != -1) {
+            local $SIG{$SIG} = 'IGNORE'               # inhibit queue processing
+                if $SIG && !($MAIN && $THREADS->tid); # in the main thread only
+            lock(@CBQ);
+            push @CBQ, $self;
+            $sig = $SIG;
+        }
         cond_broadcast($self);
     };
     Thread::Subs::_send_callback_signal()
-        if $cb && $SIG && !$CBF;
+        if $sig && !$CBF;
     return $self;
 }
 
@@ -1214,6 +1232,29 @@ if @pools contains a non-existent pool name.  The function returns
 undef immediately with no further checking if workers have not been
 started yet.
 
+=head2 mask_callback_signal
+
+This function is only relevant if you are starting threads other than
+worker threads, are using L<threads> rather than L<threads::posix>,
+and have signals enabled for callbacks.  It is irrelevant under other
+conditions.  See the L</"SIGNALS"> section for more information.
+
+Where process-based signals are used for callbacks, all threads except
+the main thread must mask the relevant signal.  Worker threads do that
+by calling this function.  If you create any threads of your own, they
+must also mask the callback signal.
+
+Threads created before the workers start (stage two) must perform this
+signal masking directly via C<POSIX::sigprocmask()>.  Threads created
+after that point can call this function instead.  If the function is
+called from the main thread or prior to worker startup, it dies.
+
+Be aware that there is a potential race between when the thread starts
+and when you call this function.  For safety, ensure that there are no
+pending callbacks when you start a thread, and that you don't create
+more callbacks until the thread has masked the signal.  Better still,
+just C<use threads::posix> and ignore this function.
+
 =head1 RESULTS
 
 The "result" sub-object (Thread::Subs::result) is returned by the shim
@@ -1324,6 +1365,8 @@ case is in callback code like the following.
 
 =head2 run_callback_queue
 
+    $count = Thread::Subs::result::run_callback_queue();
+
 This is a function which takes no arguments, but it can be invoked as
 a method if desired.  It is normally installed as the signal handler
 specified by the L</"signal"> function, but you'll need to make other
@@ -1350,7 +1393,17 @@ the queue awaiting execution at this point is lost.
 There are three methods designed to adapt this async result object to
 other similar systems.  All of these methods rely on the callback
 mechanism, so they are mutually exclusive with each other per object
-and will replace any existing callback.
+and will replace any existing callback.  Their documentation follows,
+but first, a caveat.
+
+As discussed in the L<AnyEvent> "signal watchers" documentation, it is
+not possible to have general race-free signal handling in pure Perl,
+so use any pure Perl event loop at your own risk.  This module uses
+guard variables internally to prevent such races, but the technique
+can't be applied to external modules.  As such, it is possible for a
+event loop to wait for a signal that it has already missed, and this
+will manifest as an apparent lock-up or lengthy delay.  The length of
+that delay can be limited by setting up a recurrent timer.
 
 =head3 ae_cv
 
@@ -1425,14 +1478,25 @@ handler for the chosen signal, or callbacks will cease to work.
 
 Note also that Perl's support for thread-specific signals is poor.
 The signals built into the threads module are not real OS signals and
-do not interrupt system calls, which may prevent timely resolution of
-callbacks in event-loop systems.  This module uses the Linux-specific
-C<tgkill()> syscall instead of C<< threads->kill >> if it can detect
-support for it, but falls back to native pseudo-signals if not.  For
-platforms other than Linux, try the CPAN module L<threads::posix>
-which adds real per-thread OS signal capabilities via the pthreads
-library.  This module uses L<threads::posix> instead of L<threads> if
-it's already loaded.
+do not interrupt system calls.  This generally won't work with event
+loops, so this module uses a plain C<kill()> to send real OS signals.
+Such process-based signals can be delivered to any thread, however, so
+worker threads mask the callback signal via C<POSIX::sigprocmask()>.
+If you start any other threads, you must mask the signal there too, or
+risk callbacks being delayed or lost: see L</"mask_callback_signal">.
+
+If you use L<threads::posix> instead of L<threads>, the kill method is
+a real thread-specific signal, so signal masking becomes unnecessary.
+
+This module is designed to handle its own signals, so there should be
+no need to use an event loop's signal handling features to drive the
+callback process if you are using one.  If you'd prefer that callbacks
+were processed in event loop context rather than a Perl signal handler
+context, however, you are welcome to try.  To do so, set C<$SIG{CONT}
+= 'DEFAULT'> after starting workers (assuming you use the default CONT
+signal), and then add an event-loop signal handler for it which calls
+L</"run_callback_queue">.  Whether or not this will work reliably (or
+at all) depends on the event loop implementation details.
 
 If you really can't use the signal at all, you can disable it with
 C<Thread::Subs::signal('')> prior to starting workers, but callbacks
@@ -1445,15 +1509,10 @@ via some other mechanism (like a timer) in this case.
 
 This module requires Perl v5.12 or higher.  The attribute mechanism is
 incompatible with Perl v5.10 because the sub name is not available in
-that version when MODIFY_CODE_ATTRIBUTES is called.
-
-I encountered segfaults at exit during development while running the
-test suite on v5.14 and v5.16.  While I believe I have worked around
-the issue with high probability, the segfaults are still possible, so
-I recommend against using these versions.
-
-Starting with Perl v5.22, all the dependencies of this module are part
-of the core distribution.
+that version when MODIFY_CODE_ATTRIBUTES is called.  Perl v5.18 is the
+recommended minimum, however, as it's possible to cause thread-related
+segfaults in earlier versions from reasonable code.  As of Perl v5.22,
+all the dependencies of this module are included in the core.
 
 =head2 Use Cases
 
@@ -1678,16 +1737,15 @@ pattern is likely to add complexity to the shutdown process.
 
 =head2 Enhancements
 
-L<threads::posix> enhances L<threads> to use real per-thread signals
-via the POSIX pthreads library, and this module will use it if already
-loaded.  Recommended if you're using a POSIX platform other than Linux
-or if the C<tgkill()> work-around isn't working for you on Linux due
-to missing "syscall.ph" or some other issue.
+L<threads::posix> enhances L<threads> to use real signals instead of
+pseudo-signals.  Replace C<use threads> with C<use threads::posix> in
+your code, and this module will auto-detect it.  Recommended if you're
+creating threads other than worker threads.
 
 This module has built-in support for L<AnyEvent>, L<Mojolicious> (via
 L<Mojo::Promise>), and L<Future> async interfaces.  It doesn't depend
 on any of them, however: the associated functionality is available if
-the module is already loaded.
+the relevant module is already loaded.
 
 This module contains comments suitable for L<Debug::Comments>.  If you
 want debug output which shows dispatching and callback activity, you

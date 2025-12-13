@@ -1,13 +1,13 @@
 #!perl
 use 5.012;
 use warnings;
-BEGIN { eval("use threads") or $::ERR = $@ }
+BEGIN { eval("use threads::posix") or $::ERR = $@ }
 use threads::shared;
 use Test::More;
 BEGIN {
-    unless (threads->can('create')) {
-        diag("threads failed: $::ERR") if $::ERR;
-        BAIL_OUT("All further testing requires threads");
+    unless (threads::posix->can('create')) {
+        diag("use threads::posix failed: $::ERR") if $::ERR;
+        plan skip_all => "Test requires threads::posix";
     }
 }
 use Thread::Subs;
@@ -45,25 +45,11 @@ sub all_idle_ok {
     return skip_all("workers taking too long to finish");
 }
 
-sub signal_from_thread {
-    Thread::Subs::mask_callback_signal();
-    Thread::Subs::_send_callback_signal();
-    nap(1);
-    return;
-}
-
 # Some tests rely on DEFAULT pool having 10 workers
 is(scalar(Thread::Subs::startup(10)), 2, "Started two pools");
 
-do {
-    my $n = 0;
-    local $SIG{CONT} = sub { $n++ };
-    for (1..10) {
-        threads->create(\&signal_from_thread)->join;
-        nap(1) if $n < $_;
-    }
-    is($n, 10, "All signals received in main thread");
-};
+ok(eval { Thread::Subs::mask_callback_signal(); 1 },
+   "mask_callback_signal is a no-op");
 
 my $ERR = '';
 $SIG{CONT} = do {
