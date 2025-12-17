@@ -9,7 +9,7 @@ my %WriteMakefileArgs = (
     VERSION_FROM     => 'lib/Thread/Subs.pm',
     ABSTRACT_FROM    => 'lib/Thread/Subs.pm',
     LICENSE          => 'perl_5',
-    MIN_PERL_VERSION => '5.012',
+    MIN_PERL_VERSION => '5.014',
     CONFIGURE_REQUIRES => {
         'ExtUtils::MakeMaker' => '0',
     },
@@ -18,6 +18,7 @@ my %WriteMakefileArgs = (
     },
     PREREQ_PM => {
         'threads::shared'   => '1.21',
+        'POSIX'             => '0',
         'Scalar::Util'      => '1.10',
         'Sub::Util'         => '1.40',
         'Time::HiRes'       => '0',

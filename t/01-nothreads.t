@@ -1,5 +1,5 @@
 #!perl
-use 5.012;
+use 5.014;
 use warnings;
 use Test::More;
 use Thread::Subs;

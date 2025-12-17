@@ -79,7 +79,7 @@ matches.  It finds and prints ten distinct strings which have a hex
 MD5 hash starting with five zeros.  There is no parallelism.
 
 ```perl
-use 5.012;
+use 5.014;
 use warnings;
 use Digest::MD5 qw(md5_hex);
 
@@ -99,7 +99,7 @@ to run five simultaneously.  The parallelised code is as follows, with
 attention drawn to the changes.
 
 ```perl
-use 5.012;
+use 5.014;
 use warnings;
 use threads;                   # added
 use Digest::MD5 qw(md5_hex);
@@ -112,7 +112,7 @@ sub find_partial_md5 :Thread { # added attribute
     return "$string $x";
 }
 
-Thread::Subs::startup(5); # start 5 workers
+Thread::Subs::startup(5); # added, start 5 workers
 # Same map, but we store it in an array, then process the results.
 my @work = map { find_partial_md5("blah $_", '00000') } (1..10);
 say $_->recv for @work;
@@ -268,24 +268,23 @@ sub append_file :Thread(clim=1, pool=SUB) {
     print $fh @_;
 }
 
-# Multiple callers won't interleave writes,
-# but main thread never blocks
+# Multiple callers won't block or interleave writes.
 append_file("Entry 1\n");
 append_file("Entry 2\n");
 ```
 
 ## Requirements
 
-- Perl 5.12 or later with threads
+- Perl 5.14 or later with threads
 - Working `threads` implementation
-- Core modules: threads::shared, Scalar::Util, Time::HiRes
+- Core modules: threads::shared, POSIX, Scalar::Util, Time::HiRes
 - CPAN modules: Sub::Util (1.40+) (is core as of Perl v5.22)
 
 Optional:
-- `AnyEvent` for ->ae_cv support
-- `Mojo::Promise` for ->mojo_promise support  
-- `Future` for ->future support
-- `threads::posix` for better signal handling on non-Linux platforms
+- AnyEvent for `->ae_cv` support
+- Mojo::Promise for `->mojo_promise` support  
+- Future for `->future` support
+- threads::posix for real per-thread signals
 
 ## Documentation
 
