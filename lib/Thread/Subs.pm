@@ -1,4 +1,4 @@
-use 5.012;
+use 5.014;
 use warnings;
 use if $ENV{DEBUG_THREAD_SUBS} => 'Debug::Comments';
 
@@ -11,6 +11,7 @@ package Thread::Subs;
 our $VERSION = '1.000';
 
 use threads::shared;
+use POSIX (); # sigprocmask-related
 use Scalar::Util qw(looks_like_number);
 use Sub::Util qw(set_subname subname);
 use Time::HiRes qw(time);
@@ -26,7 +27,7 @@ my %POOL;          # per-pool worker count
 my %SHIM;          # per-package auto-shim setting
 my %CLIM  :shared; # per-sub concurrency limit (shared scalar ref)
 my %DEFER :shared; # per-sub array for concurrency limits
-my %QLIM  :shared; # per-sub queue limit Thread::Subs::lim
+my %QLIM  :shared; # per-sub queue limit Thread::Subs::qlim
 my %REQ   :shared; # per-pool request arrays
 my %SUB;           # all subs Thread::Subs::attr
 my %TASK  :shared; # per-thread current sub
@@ -34,27 +35,18 @@ my %TASK  :shared; # per-thread current sub
 my $ENDWAIT = 0;
 my $STAGE :shared = 0; # 0: defs, 1: pools, 2: workers, 3: shims, 4: stop
 
+our @AllowSig;
+$AllowSig[$_] = 1 for
+    POSIX::SIGFPE(),
+    POSIX::SIGILL(),
+    POSIX::SIGPIPE(),
+    POSIX::SIGSEGV(),
+    ;
+
 our $Caller; # for _name() qualification
 
-# start_workers redefines these with signal details
+# start_workers redefines this with signal details
 sub _send_callback_signal { _die("Signal not settled yet") }
-sub mask_callback_signal  { _die("Signal not settled yet") }
-
-# Call this in a thread to ditch Config.pm after use.
-sub _get_signum {
-    my $sig = eval {
-        our %Config;
-        require Config;
-        die "no sig_name\n" unless $Config::Config{sig_name};
-        die "no sig_num\n"  unless $Config::Config{sig_num};
-        my @sig = split(' ', $Config::Config{sig_name});
-        my @num = split(' ', $Config::Config{sig_num});
-        for (0..$#sig) { return $num[$_] if $sig[$_] eq $SIG }
-        die "$SIG not found\n";
-    } // 0;
-    #@! _get_signum: @{[$@ ? $@ : "$SIG=$sig"]}
-    return $sig;
-}
 
 sub import {
     my $class = shift;
@@ -105,7 +97,7 @@ sub _define_one {
         delete $CLIM{$sub};
         delete $DEFER{$sub};
     }
-    if ($attr->qlim) { $QLIM{$sub} = Thread::Subs::lim->new($attr->qlim) }
+    if ($attr->qlim) { $QLIM{$sub} = Thread::Subs::qlim->new($attr->qlim) }
     else             { delete $QLIM{$sub} }
     return;
 }
@@ -205,11 +197,25 @@ sub signal {
     return $SIG;
 }
 
+sub safe_create_thread {
+    my $orig = POSIX::SigSet->new;
+    my $safe = POSIX::SigSet->new;
+    $safe->fillset;
+    $safe->delset($_)
+        for grep { $_ && $AllowSig[$_] } keys @AllowSig;
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), $safe, $orig)
+        // _die("Can't set sigprocmask: $!");
+    # SigSet objects segfault perl v5.12 on threads->create
+    my $thread = $THREADS->create(@_);
+    POSIX::sigprocmask(POSIX::SIG_SETMASK(), $orig)
+        // _die("Can't restore sigprocmask: $!");
+    return $thread;
+}
+
 sub _be_worker {
     my ($pool) = @_;
     my $id = join('-', $THREADS->tid, $pool);
     #@! Worker $id spawned
-    mask_callback_signal();
     do { lock(%TASK); $TASK{$id} = ''; cond_signal(%TASK) };
     my $queue = $REQ{$pool};
     my ($work, $result, $sub, @arg, $clim, $qlim);
@@ -235,7 +241,7 @@ sub _be_worker {
             }
         }
         #@! Worker $id assigned to $sub
-        do { lock(%TASK); $TASK{$id} = $sub };
+        $TASK{$id} = $sub;
         cond_signal(@$queue) if @$queue;
         return 1;
     };
@@ -256,7 +262,7 @@ sub _be_worker {
             }
         }
         #@! Worker $id finished handling $sub
-        do { lock(%TASK); $TASK{$id} = '' };
+        $TASK{$id} = '';
     }
     #@! Worker $id exits
     return;
@@ -272,7 +278,7 @@ sub start_workers {
     no warnings 'redefine';
     if (!$SIG) {
         #@! No signal or handler for callbacks
-        *_send_callback_signal = *mask_callback_signal = sub { };
+        *_send_callback_signal = sub { };
     }
     elsif ($THREADS ne 'threads') {
         #@! Using $THREADS->kill($SIG) for callbacks
@@ -281,23 +287,13 @@ sub start_workers {
             $MAIN->kill($SIG);
             return;
         };
-        *mask_callback_signal = sub { }; # not needed
     }
     else {
-        my $signum = $THREADS->create(\&_get_signum)->join;
-        _die("Unable to determine signal number for '$SIG'")
-            unless $signum;
-        #@! Using kill $SIG ($signum) for callbacks
+        #@! Using kill $SIG for callbacks
         *_send_callback_signal = sub {
-            #@! Sending $SIG ($signum) to PID=$$
-            kill $signum, $$;
+            #@! Sending $SIG to PID=$$
+            kill $SIG, $$;
             return;
-        };
-        require POSIX;
-        *mask_callback_signal = sub {
-            _die("Attempt to mask_callback_signal in the main thread")
-                unless $THREADS->tid;
-            return POSIX::sigprocmask(POSIX::SIG_BLOCK(), POSIX::SigSet->new($signum));
         };
     }
     lock(%TASK);
@@ -306,7 +302,7 @@ sub start_workers {
         #@! Starting '$pool' worker pool ($count)
         $REQ{$pool} = shared_clone([]);
         for (1..$count) {
-            my $tid = $THREADS->create(\&_be_worker, $pool)->tid;
+            my $tid = safe_create_thread(\&_be_worker, $pool)->tid;
             cond_wait(%TASK) until exists($TASK{"$tid-$pool"});
         }
     }
@@ -330,11 +326,12 @@ sub shim {
             unless $STAGE < 4;
         #@! Requesting $sub pool=$pool @{[$qlim ? 'qlim='.$qlim->slack : '']}
         my $res = Thread::Subs::result->new;
-        $qlim->in if $qlim; # can block
         $res->fatal("Exception in sub '$sub'")
             unless defined(wantarray) or $THREADS->tid;
+        my $req = shared_clone([$sub, $res, @_]);
+        $qlim->in if $qlim; # can block; can die in signal context
         lock(@$queue);
-        push @$queue, shared_clone([$sub, $res, @_]);
+        push @$queue, $req; # critical: must be interrupt-safe!
         cond_signal(@$queue);
         return $res;
     };
@@ -390,7 +387,6 @@ sub stop_workers {
 
 sub running_workers {
     my @thr;
-    lock(%TASK);
     for (keys %TASK) {
         if (my $t = $THREADS->object(/^(\d+)/)) {
             if    ($t->is_joinable) { $t->join; delete $TASK{$_} }
@@ -412,7 +408,7 @@ sub stop_and_wait {
     return;
 }
 
-sub current_tasks { lock(%TASK); running_workers(); return %TASK }
+sub current_tasks { running_workers(); return %TASK }
 
 sub queue_slack {
     local $Caller = caller;
@@ -434,7 +430,6 @@ sub is_idle {
     lock(@$_) for map { $REQ{$_} } @pool;
     return 0 if grep { @{$REQ{$_}} > 0 } @pool;
     my $pools = join('|', map { quotemeta($_) } @pool);
-    lock(%TASK);
     return 0
         for grep { $TASK{$_} and /-(?:$pools)$/ } keys %TASK;
     return 1;
@@ -464,7 +459,7 @@ sub qlim { @_ == 1 ? $_[0][2] || 0        : do { $_[0][2] = $_[1]; $_[0] } }
 sub shim { @_ == 1 ? !!$_[0][3]           : do { $_[0][3] = $_[1]; $_[0] } }
 
 
-package Thread::Subs::lim;
+package Thread::Subs::qlim;
 
 use threads::shared;
 
@@ -484,14 +479,21 @@ sub slack {
     return $self->[1] - $self->[0];
 }
 
+# The ++ operator isn't interrupt-safe, but pushing a single scalar to
+# an array is: we can detect race conditions but can't prevent them.
 sub in {
     my ($self) = @_;
     lock($self);
+    _die("Race detected: qlim sub called from signal handler")
+        if @$self > 2;
+    push @$self, 1; # for above race detection
     my $ticket = $self->[0]++;
+    pop @$self;     # end of critical section
     cond_wait($self) until $ticket < $self->[1];
     return;
 }
 
+# This isn't interrupt-safe, but it's only called from _be_worker.
 sub out {
     my ($self) = @_;
     lock($self);
@@ -528,18 +530,6 @@ sub new { bless shared_clone([0, 0]) }
 
 sub _id { $MAIN ? is_shared($_[0]) // _die("BUG: result object not shared") : refaddr($_[0]) }
 
-sub _callback {
-    my ($self) = @_;
-    my $id = $self->_id;
-    if ($id && $CB{$id}) {
-        _die("BUG: attempt to invoke callback on unready result")
-            unless $self->[0];
-        (delete $CB{$id})->($self);
-        #@! Callback executed successfully
-    }
-    return;
-}
-
 # NB: this can be executed directly or by a signal handler, so it can
 # interrupt itself!  $CBF handles self-exclusion.
 sub run_callback_queue {
@@ -553,12 +543,20 @@ sub run_callback_queue {
         my $result = do {
             lock(@CBQ);
             if (@CBQ) { shift @CBQ }
-            else      { $CBF = 0   }
+            else { $CBF = 0; $CBF = 1 if @CBQ } # signal race possile
         };
-        if ($result) {
+        if (ref $result) {
             $n++;
-            eval { $result->_callback; 1 }
-            or do { $CBF = 0; die $@ };
+            eval {
+                my $id = $result->_id;
+                if ($id && $CB{$id}) {
+                    _die("BUG: attempt to invoke callback on unready result")
+                        unless $result->[0];
+                    (delete $CB{$id})->($result);
+                    #@! Callback executed successfully
+                }
+                return 1;
+            } or do { $CBF = 0; die $@ };
         }
     }
     #@! Callback processing complete ($n)
@@ -574,12 +572,12 @@ sub cb {
     return $self if $CBF == -1; # no-op if END reached
     my $sig;
     do {
+        local $SIG{$SIG} = sub { $sig = 1 } if $SIG; # defer callbacks
         lock($self);
         if ($cb) { $CB{$id} = $cb  }
         else     { delete $CB{$id} }
         if ($self->[0] == 0) { $self->[1] = $cb ? 1 : 0 }
         elsif ($cb) {
-            local $SIG{$SIG} = 'IGNORE' if $SIG; # inhibit queue processing
             lock(@CBQ);
             push @CBQ, $self;
             $sig = $SIG;
@@ -598,12 +596,12 @@ sub _set {
     my $args = shared_clone([@_]);
     my $sig;
     do {
+        local $SIG{$SIG} = sub { $sig = 1 }       # defer callbacks
+            if $SIG && !($MAIN && $THREADS->tid); # if main thread
         lock($self);
         my $cb = $self->[0] == 0 && $self->[1];
         @$self = @$args;
         if ($cb && $CBF != -1) {
-            local $SIG{$SIG} = 'IGNORE'               # inhibit queue processing
-                if $SIG && !($MAIN && $THREADS->tid); # in the main thread only
             lock(@CBQ);
             push @CBQ, $self;
             $sig = $SIG;
@@ -907,6 +905,10 @@ more than one thread might block on a queue limit.  If so, they will
 unblock in FIFO order.  Beware of possible deadlock in this case: see
 L</"Threads Calling Threads"> for more detail.
 
+The potential for blocking and the FIFO ordering mechanism make subs
+with a qlim unsuitable for calling in signal handlers or signal-based
+callbacks.  Violating this rule may result in exceptions or deadlock.
+
 =head1 FUNCTIONS
 
 The module is primarily driven by functions, but also has a "result"
@@ -1051,9 +1053,15 @@ The callback mechanism relies on worker threads sending this signal to
 the main thread when ready.  The callback is then executed in the main
 thread in the context of this signal handler.  If you set $sig to a
 false value, then no signal handler is installed and callbacks won't
-work unless you poll L</"run_callback_queue">; the returned value will
-be empty string in this case.  The signal handler is installed right
-after the workers start if true.  See L</"SIGNALS"> for more detail.
+work unless you poll L</"run_callback_queue">; the returned $sig will
+be empty string in this case.
+
+The signal handler is installed right after the workers start if true.
+Selecting a signal in this manner means you are delegating control of
+the %SIG entry to this module: it will not only install the signal
+handler, but occasionally localise it to something else.
+
+See L</"SIGNALS"> for more detail.
 
 =head2 start_workers
 
@@ -1232,28 +1240,35 @@ if @pools contains a non-existent pool name.  The function returns
 undef immediately with no further checking if workers have not been
 started yet.
 
-=head2 mask_callback_signal
+=head2 safe_create_thread
 
-This function is only relevant if you are starting threads other than
-worker threads, are using L<threads> rather than L<threads::posix>,
-and have signals enabled for callbacks.  It is irrelevant under other
-conditions.  See the L</"SIGNALS"> section for more information.
+    $thread = Thread::Subs::safe_create_thread($sub, @args);
 
-Where process-based signals are used for callbacks, all threads except
-the main thread must mask the relevant signal.  Worker threads do that
-by calling this function.  If you create any threads of your own, they
-must also mask the callback signal.
+This is a wrapper around C<< threads->create($sub, @args) >> (or class
+L<threads::posix>, if loaded) which uses C<POSIX::sigprocmask()> to
+block most signals to the thread.  With few exceptions, signals should
+be handled by the main thread only.  You can change the set of signals
+permitted via @Thread::Subs::AllowSig: any element of the array with a
+true value permits the corresponding signal number.  Such changes only
+affect subsequent calls to this function, not existing threads.
 
-Threads created before the workers start (stage two) must perform this
-signal masking directly via C<POSIX::sigprocmask()>.  Threads created
-after that point can call this function instead.  If the function is
-called from the main thread or prior to worker startup, it dies.
+By default, the following signals are allowed: FPE, ILL, SEGV, and
+PIPE.  The first three are "synchronous" signals which are likely to
+result in a core dump regardless of the thread in which they occur.
+PIPE is permitted because it can be raised against a thread in normal
+IO operations, and will continue its default behaviour of killing the
+process if not handled.  Changes to C<$SIG{PIPE}> in a thread sub are
+best performed with C<local> to keep things orderly.  If any of these
+signals are blocked when you call the function, they remain blocked in
+the new thread.
 
-Be aware that there is a potential race between when the thread starts
-and when you call this function.  For safety, ensure that there are no
-pending callbacks when you start a thread, and that you don't create
-more callbacks until the thread has masked the signal.  Better still,
-just C<use threads::posix> and ignore this function.
+You'll want to use this function if creating a thread other than a
+worker thread; without this, a thread might receive a signal for a
+callback which it can't serve, losing the signal at best, killing the
+thread at worst.  Worker threads are also created via this function,
+ensuring that general signal handling happens in the main thread.
+
+See L</"SIGNALS"> for further details on the subject.
 
 =head1 RESULTS
 
@@ -1288,31 +1303,43 @@ This has no equivalent in L<AnyEvent>.
 Gets or sets the callback for the $result.  This can only be done from
 the main thread: it's possible in principle to have callbacks to any
 thread, but it would be very complex to implement and use, so support
-is limited to the simple case.
+is limited to the simple case.  Unlike its L<AnyEvent> equivalent, the
+set mode returns self.
 
 You can only set one callback: a second set operation replaces the old
 callback if it has not yet been called, and a false argument cancels
 the callback.  The callback is also removed on execution.  If the
-$result is ready when you set a callback, the callback may or may not
-have executed already when the method returns: make no assumptions.
-Unlike its L<AnyEvent> equivalent, the set mode returns self.
+$result is ready when you set a callback, and callbacks are driven by
+a signal (default behaviour), that signal is raised before this method
+returns.  In this case it is likely that the callback has executed as
+well, but it is not guaranteed: make no assumptions about timing.
 
-There is no particular guarantee as to when a callback will run once
-the result is ready, but the module considers the order of readiness
-to be important and preserves it.  The callback is enqueud when it is
-set if the result is ready, or when it becomes ready if set before
-then: whichever activity comes second adds the callback to the queue.
-What this means for your code is that calls to "clim=1" subs execute
-their callbacks in the same order so long as the callbacks are set in
-the same order.  In the general case, you don't have any guarantee of
-execution order: it's all a race.
+While the timing of callbacks can vary, some guarantees are offered
+for order of execution, particularly for "clim=1" subs.  In short, if
+you call such a sub more than once and set callbacks on the results in
+the same order, the callbacks will execute in that order.  Generally,
+callbacks are added to the queue at whatever moment they become both
+data-ready and callback-set, and it's a race as to the order in which
+that happens.
 
 Callbacks are executed by the L</"run_callback_queue"> function, which
-is normally invoked by a signal handler, so callback code should be
+is normally invoked as a signal handler, so callback code should be
 constrained to the same basics which are suitable in a signal handler.
-The $result is passed as the only argument, and any returned value is
-ignored.  Exceptions raised in callbacks will normally be fatal
-because the signal handler won't catch them.
+In particular, avoid blocking: you might block on something which
+won't be ready until the code you interrupted completes, resulting in
+deadlock.  This includes calls to thread subs with a "qlim" value: not
+only can they block, but if the interrupt occurs when the main thread
+is in the critical section of that same qlim check, an exception will
+be raised.  Calls to thread subs with no qlim are fine, however.
+
+If you need to execute something modestly complex, it's best to raise
+a flag and deal with it outside the callback context.  Event loops can
+also be used to defer execution: see L</"Async Adaptors">, below.
+
+The callback is invoked in a void context with the $result passed as
+the only argument.  Any returned value is ignored.  Exceptions raised
+in callbacks will normally be fatal because the signal handler won't
+catch them.  See L</"SIGNALS"> for more detail.
 
 Once you've set a callback, you are not obliged to keep the $result
 object: it will be kept alive by the worker thread which is providing
@@ -1388,6 +1415,10 @@ When the program reaches the END phase, all still-pending callbacks
 are cancelled, and this function becomes a no-op.  Anything still in
 the queue awaiting execution at this point is lost.
 
+It is not safe to call this function from a signal handler context
+other than the one specified by L</"signal">: multiple parts of the
+module need to know what that signal is and whether it is in use.
+
 =head2 Async Adaptors
 
 There are three methods designed to adapt this async result object to
@@ -1400,7 +1431,7 @@ As discussed in the L<AnyEvent> "signal watchers" documentation, it is
 not possible to have general race-free signal handling in pure Perl,
 so use any pure Perl event loop at your own risk.  This module uses
 guard variables internally to prevent such races, but the technique
-can't be applied to external modules.  As such, it is possible for a
+can't be applied to external modules.  As such, it is possible for an
 event loop to wait for a signal that it has already missed, and this
 will manifest as an apparent lock-up or lengthy delay.  The length of
 that delay can be limited by setting up a recurrent timer.
@@ -1410,7 +1441,8 @@ that delay can be limited by setting up a recurrent timer.
 This requires L<AnyEvent> to be loaded and returns a real L<AnyEvent>
 condition variable.  This is preferable if you are using L<AnyEvent>,
 because calling C<recv()> on it will run the event loop, whereas the
-base result object would block.
+base result object would block.  It also provides a safer context for
+callback execution.
 
 =head3 mojo_promise
 
@@ -1474,45 +1506,85 @@ to the 'CONT' signal, but this is harmless.
 The primary advantage of 'CONT' is simply that nothing else is likely
 to use it.  If it's too exotic for your tastes, select a conventional
 user signal instead.  Just ensure that nothing else installs a %SIG
-handler for the chosen signal, or callbacks will cease to work.
+handler for the chosen signal.
 
 Note also that Perl's support for thread-specific signals is poor.
 The signals built into the threads module are not real OS signals and
 do not interrupt system calls.  This generally won't work with event
 loops, so this module uses a plain C<kill()> to send real OS signals.
 Such process-based signals can be delivered to any thread, however, so
-worker threads mask the callback signal via C<POSIX::sigprocmask()>.
-If you start any other threads, you must mask the signal there too, or
-risk callbacks being delayed or lost: see L</"mask_callback_signal">.
+worker threads block nearly all the available signals, leaving signal
+processing to the main thread: see L</"safe_create_thread">.  If you
+start any other threads, you should at least block the callback signal
+there as well, or risk callbacks being delayed or lost.
 
 If you use L<threads::posix> instead of L<threads>, the kill method is
-a real thread-specific signal, so signal masking becomes unnecessary.
+a real thread-specific signal, and the callback signal will be sent to
+the main thread specifically instead of the whole process.
 
-This module is designed to handle its own signals, so there should be
-no need to use an event loop's signal handling features to drive the
-callback process if you are using one.  If you'd prefer that callbacks
-were processed in event loop context rather than a Perl signal handler
-context, however, you are welcome to try.  To do so, set C<$SIG{CONT}
-= 'DEFAULT'> after starting workers (assuming you use the default CONT
-signal), and then add an event-loop signal handler for it which calls
-L</"run_callback_queue">.  Whether or not this will work reliably (or
-at all) depends on the event loop implementation details.
+This module is designed to handle its own signals: significant effort
+has been invested to ensure that the callback process is safe and free
+of race conditions.  If using an event loop which handles signals,
+ensure that it does not interfere with the signal used for callbacks.
+Note that pure Perl event loops are likely to contain race conditions:
+see L</"Async Adaptors">.  L<EV> is recommended.
 
-If you really can't use the signal at all, you can disable it with
-C<Thread::Subs::signal('')> prior to starting workers, but callbacks
-require that you call C<Thread::Subs::result::run_callback_queue()>
-via some other mechanism (like a timer) in this case.
+=head2 Limitations of Signal Handlers
+
+Programming with callbacks and the limitations of signals does not
+scale well, so you should plan to integrate with an event loop in any
+serious project, using callbacks only to set up event loop work.  That
+said, be aware of the following issues if using this module without an
+event loop.
+
+Callbacks generally happen in a signal handler context, so it's
+important to know what actions are permitted in that context.  The key
+thing to understand is that you are interrupting something, and you
+have no idea what.  Blocking in such a context is generally unsafe:
+the code you interrupted may hold locks which are in turn blocking
+other things, and deadlock can result.  As such, the basic rules are
+don't block, lock carefully, and be quick about it.
+
+Some activities are simply unsafe in signal handlers because signals
+can interrupt critical sections.  The main culprit here is thread subs
+with a qlim: not only do they potentially block, but the mechanism
+which manages queue entry has a critical section.  Re-entry into an
+interrupted critical section can be detected, but the only solution is
+to bail out with an exception.  As such, avoid calling thread subs
+with a qlim from any signal handler, including signal-based callbacks:
+the call may result in deadlock or raise an exception.
+
+Worker threads should only make limited use of signals, such as PIPE,
+and do so by using C<local> on the relevant handler.  Most signals are
+blocked by default in workers: see L</"safe_create_thread">.  Worker
+threads can't use callbacks, so thread subs are not appropriate for
+use in worker signal handlers in most cases, but they are safe to call
+if they have no qlim.
+
+The L</"FUNCTIONS"> are not certified signal-handler safe.  They may
+be, but no promises.  Deadlock may be possible due to locks being
+acquired in the wrong order.  Some functions detect the caller's
+package via C<caller()>, which is indeterminate in a signal context.
+The "stage" of operation may be indeterminate in a signal context if
+you interrupted a function which changes it.  I trust you can see why
+no promises are made.
+
+=head2 Working Without Signals
+
+If you really can't use the callback signal at all, you can disable it
+with C<Thread::Subs::signal('')> before starting workers, but you will
+need to poll C<Thread::Subs::result::run_callback_queue()> via some
+other mechanism (like a timer) in this case for callbacks to work.  It
+is not safe to call it from a signal handler in this way, however.
 
 =head1 NOTES
 
 =head2 Version Compatibility
 
-This module requires Perl v5.12 or higher.  The attribute mechanism is
-incompatible with Perl v5.10 because the sub name is not available in
-that version when MODIFY_CODE_ATTRIBUTES is called.  Perl v5.18 is the
-recommended minimum, however, as it's possible to cause thread-related
-segfaults in earlier versions from reasonable code.  As of Perl v5.22,
-all the dependencies of this module are included in the core.
+This module requires Perl v5.14 or higher.  The recommended minimum is
+v5.18, however, as it's possible to cause thread-related segfaults in
+earlier versions from reasonable code.  As of Perl v5.22, all the
+dependencies of this module are included in the core.
 
 =head2 Use Cases
 
@@ -1740,7 +1812,7 @@ pattern is likely to add complexity to the shutdown process.
 L<threads::posix> enhances L<threads> to use real signals instead of
 pseudo-signals.  Replace C<use threads> with C<use threads::posix> in
 your code, and this module will auto-detect it.  Recommended if you're
-creating threads other than worker threads.
+creating additional threads and using signals to coordinate them.
 
 This module has built-in support for L<AnyEvent>, L<Mojolicious> (via
 L<Mojo::Promise>), and L<Future> async interfaces.  It doesn't depend

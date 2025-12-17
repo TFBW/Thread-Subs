@@ -1,5 +1,5 @@
 #!perl
-use 5.012;
+use 5.014;
 use warnings;
 BEGIN { eval("use threads") or $::ERR = $@ }
 use threads::shared;
@@ -46,7 +46,6 @@ sub all_idle_ok {
 }
 
 sub signal_from_thread {
-    Thread::Subs::mask_callback_signal();
     Thread::Subs::_send_callback_signal();
     nap(1);
     return;
@@ -59,7 +58,7 @@ do {
     my $n = 0;
     local $SIG{CONT} = sub { $n++ };
     for (1..10) {
-        threads->create(\&signal_from_thread)->join;
+        Thread::Subs::safe_create_thread(\&signal_from_thread)->join;
         nap(1) if $n < $_;
     }
     is($n, 10, "All signals received in main thread");
@@ -138,6 +137,30 @@ like($WARN, qr/scalar$/, "Warn method produces warning");
 
 eval { Thread::Subs::shim(\&nap) };
 ok($@, "Exception raised on attempt to shim non-thread sub");
+
+do {
+    $x = 0;
+    my $t = time + 5.0;
+    local $SIG{USR1} = sub { test(2)->cb(sub { $x++ }) };
+    for (1..5) {
+        test(2)->cb(sub { $x++ });
+        kill USR1 => $$;
+    }
+    nap(2) until $x == 10 or time > $t;
+    is($x, 10, "Called from signal");
+};
+
+do {
+    $x = 0;
+    test(2 * $_) for 1..4; # other work, untested
+    test(2)->cb(sub { test(2)->cb(sub { test(2)->cb(sub { $x = 1 }) }) });
+    test(2 * $_) for 1..4; # other work, untested
+    local $SIG{ALRM} = sub { $x ||= -1 };
+    alarm 5;
+    nap(2) until $x;
+    alarm 0;
+    is($x, 1, "Called from callback");
+};
 
 is(t2t(2)->recv, 2, "Thread to thread");
 

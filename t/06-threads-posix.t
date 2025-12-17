@@ -1,5 +1,5 @@
 #!perl
-use 5.012;
+use 5.014;
 use warnings;
 BEGIN { eval("use threads::posix") or $::ERR = $@ }
 use threads::shared;
@@ -47,9 +47,6 @@ sub all_idle_ok {
 
 # Some tests rely on DEFAULT pool having 10 workers
 is(scalar(Thread::Subs::startup(10)), 2, "Started two pools");
-
-ok(eval { Thread::Subs::mask_callback_signal(); 1 },
-   "mask_callback_signal is a no-op");
 
 my $ERR = '';
 $SIG{CONT} = do {
@@ -124,6 +121,30 @@ like($WARN, qr/scalar$/, "Warn method produces warning");
 
 eval { Thread::Subs::shim(\&nap) };
 ok($@, "Exception raised on attempt to shim non-thread sub");
+
+do {
+    $x = 0;
+    my $t = time + 5.0;
+    local $SIG{USR1} = sub { test(2)->cb(sub { $x++ }) };
+    for (1..5) {
+        test(2)->cb(sub { $x++ });
+        kill USR1 => $$;
+    }
+    nap(2) until $x == 10 or time > $t;
+    is($x, 10, "Called from signal");
+};
+
+do {
+    $x = 0;
+    test(2 * $_) for 1..4; # other work, untested
+    test(2)->cb(sub { test(2)->cb(sub { test(2)->cb(sub { $x = 1 }) }) });
+    test(2 * $_) for 1..4; # other work, untested
+    local $SIG{ALRM} = sub { $x ||= -1 };
+    alarm 5;
+    nap(2) until $x;
+    alarm 0;
+    is($x, 1, "Called from callback");
+};
 
 is(t2t(2)->recv, 2, "Thread to thread");
 
