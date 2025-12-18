@@ -143,6 +143,10 @@ $r->cb(sub { $a = 2 });
 is(Thread::Subs::result::run_callback_queue(), 1, "One queued callback ran");
 is($a, 2, "New callback executed");
 ok(!$r->cb, "Callback cleared");
+$r->send('y');
+is($r->data, 'x', "Second send has no effect");
+$r->croak('y');
+is($r->data, 'x', "Croak has no effect after send");
 
 &new_r;
 $r->cb(sub {
@@ -152,5 +156,7 @@ $r->cb(sub {
 $r->croak("die");
 eval { $r->recv };
 ok($@, "Exception raised");
+$r->send('x');
+is($r->data, 'die', "Send has no effect after croak");
 
 done_testing();
