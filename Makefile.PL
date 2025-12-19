@@ -14,7 +14,8 @@ my %WriteMakefileArgs = (
         'ExtUtils::MakeMaker' => '0',
     },
     TEST_REQUIRES => {
-        'Test::More' => '0',
+        'Test::More'  => '0',
+        'Digest::MD5' => '0',
     },
     PREREQ_PM => {
         'threads::shared'   => '1.21',

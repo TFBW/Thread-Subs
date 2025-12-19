@@ -10,6 +10,8 @@ t/02-threads.t
 t/03-anyevent.t
 t/04-mojo.t
 t/05-future.t
+t/06-threads-posix.t
+t/07-stress.t
 t/manifest.t
 t/pod-coverage.t
 t/pod.t
