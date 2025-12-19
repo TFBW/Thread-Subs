@@ -5,7 +5,7 @@ subs are executed by a static pool of worker threads in parallel with
 your main thread.  It hides most of the complexity of parallelism
 behind ordinary subroutine calls which return async result objects.
 
-Requires Perl with support for threads enabled.
+Requires Perl v5.14+ with support for threads enabled.
 
 
 INSTALLATION
