@@ -3,11 +3,14 @@ use 5.014;
 use warnings;
 use threads;
 use Digest::MD5 qw(md5_hex);
+use POSIX qw(pause);
 use Test::More;
 use Thread::Subs;
+use Time::HiRes qw(alarm);
 
 # Multiple submitters (client pool) hammer a qlim-and-clim-constrained
 # sub (server pool).  Exercises all the limiters under contention.
+# Actively interrupted by alarm() and callbacks.
 
 my $SUBMITTERS      = $ENV{STRESS_SUBMITTERS}      // 10;
 my $WORKERS         = $ENV{STRESS_WORKERS}         // 6;
@@ -37,8 +40,21 @@ my %pool = Thread::Subs::startup(
 is($pool{client}, $SUBMITTERS, "$SUBMITTERS submitters");
 is($pool{server}, $WORKERS, "$WORKERS workers");
 
+$SIG{ALRM} = sub {
+    note "Queue: ".join(' ',Thread::Subs::queue_slack());
+    alarm(0.1);
+};
+$SIG{ALRM}->();
 my $total = 0;
-my @test = map { submitter($_) } 1..$SUBMITTERS;
+my $results = 0;
+my @test;
+for my $n (1..$SUBMITTERS) {
+    my $cb = sub { $results++; note "Submitter #$n returned ".$_[0]->recv };
+    push @test, submitter($n)->cb($cb);
+}
+pause until $results == $SUBMITTERS;
+alarm(0);
+
 $total += $_->recv for @test;
 my $expected = $SUBMITTERS * $REQUESTS_EACH;
 is($total, $expected, "All $expected results correct");
