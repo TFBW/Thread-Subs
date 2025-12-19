@@ -742,8 +742,8 @@ provide a high-level abstraction that minimises cognitive overhead.
 After the one-time pool startup, the presence of worker threads is
 almost invisible in application code.  The ideal is that one simply
 declares a sub to be threaded; in practice you also need to change the
-sub interface to accommodate the fact that it becomes non-blocking,
-but this will be familiar to anyone who has used an event loop.
+sub call to accommodate the fact that it becomes non-blocking, but
+this will be familiar to anyone who has used an event loop.
 
 Note that this documentation is not a tutorial on threading or even on
 Perl threads in particular.  It aims to be as accessable as possible,
@@ -1470,9 +1470,9 @@ that delay can be limited by setting up a recurrent timer.
 
 This requires L<AnyEvent> to be loaded and returns a real L<AnyEvent>
 condition variable.  This is preferable if you are using L<AnyEvent>,
-because calling C<recv()> on it will run the event loop, whereas the
-base result object would block.  It also provides a safer context for
-callback execution than the default signal handler context.
+because calling C<< ->recv >> on it will run the event loop, whereas
+the base result object would block.  It also provides a safer context
+for callback execution than the default signal handler context.
 
 =head3 mojo_promise
 
@@ -1871,11 +1871,11 @@ operation happens after worker threads start, so workers always see
 the original global subs, not the shimmed replacements.
 
 The second major rule is that worker threads can only obtain results
-via the blocking C<recv()> or C<data()> methods, not callbacks or any
-of the methods which rely on them: callbacks are strictly limited to
-the main thread.  As such, a shim called in a void context in a worker
-thread does not apply the L</"fatal"> method to the result: exceptions
-will simply be ignored silently.
+via the blocking C<< ->recv >> or C<< ->data >> methods, not callbacks
+or any of the methods which rely on them: callbacks are strictly
+limited to the main thread.  As such, a shim called in a void context
+in a worker thread does not apply the L</"fatal"> method to the
+result: exceptions will simply be ignored silently.
 
 Lastly, watch out for potential deadlock situations.  A worker that
 blocks waiting for other workers is a potential source of deadlock,
