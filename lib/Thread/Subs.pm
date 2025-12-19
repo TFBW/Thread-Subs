@@ -1318,6 +1318,11 @@ This is a blocking receive operation: it will block until a result has
 been sent, then either return that @data or raise an exception if the
 result was a failure.  Returns C<$data[0]> in a scalar context.
 
+Be warned that this kind of blocking is not signal-friendly.  Signal
+handlers will not get a chance to run while you are waiting.  This
+includes other callbacks you may have requested.  If you receive too
+many signals while blocked, perl may bail out.
+
 =head2 data
 
     @data = $result->data;
